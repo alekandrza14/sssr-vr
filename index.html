@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>SSSR VR</title>
+<style>
+  :root { --bg:#111418; --panel:#1b2027; --line:#2c333d; --text:#e8ecf1; --muted:#8e98a5; --accent:#38d26b; --warn:#ff6b5b; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text); font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  button,input,select { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
+  button { cursor:pointer; } button.main { background:var(--accent); color:#06150b; border:0; font-weight:600; }
+  .screen { display:none; padding:16px; max-width:900px; margin:0 auto; }
+  .screen.on { display:block; }
+  h1 { font-size:22px; margin:8px 0 4px; } h2 { font-size:16px; margin:18px 0 8px; color:var(--muted); font-weight:600; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; margin:12px 0; }
+  .code { font-size:44px; letter-spacing:8px; font-weight:700; color:var(--accent); }
+  .muted { color:var(--muted); font-size:13px; }
+  label.s { display:grid; grid-template-columns:150px 1fr 52px; gap:8px; align-items:center; margin:6px 0; }
+  .views { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .views > div { position:relative; } .views video, .views canvas { width:100%; border-radius:8px; background:#000; display:block; image-rendering:pixelated; }
+  .views .tag { position:absolute; left:6px; top:6px; font-size:12px; background:#000a; padding:2px 6px; border-radius:6px; }
+  #status, #vrStatus { font-size:13px; }
+  .ok { color:var(--accent); } .bad { color:var(--warn); }
+  #vr { position:fixed; inset:0; display:none; background:#000; }
+  #vr.on { display:block; } #vr canvas { display:block; width:100%; height:100%; }
+  #vrBar { position:absolute; left:0; right:0; top:0; display:flex; gap:6px; padding:6px; justify-content:center; transition:opacity .3s; }
+  #vrBar button { padding:6px 10px; font-size:13px; background:#000b; }
+  @media (max-width:600px) { .views { grid-template-columns:1fr; } label.s { grid-template-columns:110px 1fr 46px; } }
+</style>
+</head>
+<body>
+
+<!-- ===================== выбор режима ===================== -->
+<div class="screen on" id="home">
+  <h1>SSSR VR</h1>
+  <div class="muted">VR для бедных: вебка + телефон в коробке. Связь напрямую, без сервера.</div>
+  <div class="card">
+    <div class="row"><button class="main" id="goPc">💻 Это ПК с вебкой</button></div>
+    <div class="muted">Трекинг рук по двум ярким предметам (по умолчанию зелёным).</div>
+  </div>
+  <div class="card">
+    <div class="row"><button class="main" id="goPhone">📱 Это телефон (VR)</button></div>
+    <div class="muted">Сцена в двух половинах экрана, поворот головы по гироскопу.</div>
+  </div>
+</div>
+
+<!-- ===================== ПК: трекер ===================== -->
+<div class="screen" id="pc">
+  <h1>ПК — трекер рук</h1>
+  <div class="card">
+    <div class="muted">Код для телефона</div>
+    <div class="code" id="code">····</div>
+    <div id="status" class="muted">Подключение к PeerJS…</div>
+  </div>
+
+  <div class="views">
+    <div><video id="video" playsinline muted></video><span class="tag">Вебка — нажми на предмет, чтобы взять цвет</span></div>
+    <div><canvas id="maskView"></canvas><span class="tag">Маска: <span style="color:#ff5050">левая</span> / <span style="color:#4f8cff">правая</span></span></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="calSize" class="main">Запомнить размер (K)</button>
+      <select id="camSel"></select>
+    </div>
+    <div class="muted">Держи оба предмета на расстоянии «калибровки» от вебки и нажми «Запомнить размер».</div>
+    <div class="row">
+      <label><input type="checkbox" id="facesUser"> Вебка смотрит на меня (стоит напротив)</label>
+      <label><input type="checkbox" id="mirror"> Отзеркалить</label>
+    </div>
+    <label class="s">Допуск цвета <input type="range" id="hueTol" min="0.01" max="0.3" step="0.01" value="0.08"><span></span></label>
+    <label class="s">Мин. насыщенность <input type="range" id="minSat" min="0" max="1" step="0.01" value="0.35"><span></span></label>
+    <label class="s">Мин. яркость <input type="range" id="minVal" min="0" max="1" step="0.01" value="0.25"><span></span></label>
+    <label class="s">Калибровка, м <input type="range" id="calDist" min="0.1" max="1.5" step="0.05" value="0.4"><span></span></label>
+    <label class="s">Сглаживание <input type="range" id="smooth" min="0" max="0.95" step="0.05" value="0.5"><span></span></label>
+    <label class="s">Угол вебки, ° <input type="range" id="fov" min="40" max="100" step="1" value="60"><span></span></label>
+    <div class="row muted">Цвет: <span id="colorSwatch" style="display:inline-block;width:22px;height:22px;border-radius:6px;border:1px solid var(--line)"></span> <span id="handsInfo"></span></div>
+  </div>
+</div>
+
+<!-- ===================== телефон ===================== -->
+<div class="screen" id="phone">
+  <h1>Телефон — VR</h1>
+  <div class="card">
+    <div class="row">
+      <input id="codeIn" inputmode="numeric" maxlength="4" placeholder="Код с ПК" style="width:130px;font-size:22px;letter-spacing:4px">
+      <button class="main" id="connect">Подключиться</button>
+    </div>
+    <div id="vrStatus" class="muted">Не подключено</div>
+  </div>
+  <div class="card">
+    <div class="row">
+      <label><input type="checkbox" id="stereo" checked> Два глаза (для коробки)</label>
+    </div>
+    <label class="s">Расстояние глаз, мм <input type="range" id="ipd" min="50" max="75" step="1" value="63"><span></span></label>
+    <div class="row"><button class="main" id="startVr">▶ Старт VR</button></div>
+    <div class="muted">Поверни телефон горизонтально. Двойной тап в VR — выровнять взгляд вперёд. Тап — показать/скрыть кнопки.</div>
+  </div>
+</div>
+
+<div id="vr">
+  <div id="vrBar"><button id="recenter">⟳ Центр</button><button id="exitVr">✕ Выход</button></div>
+</div>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { StereoEffect } from 'three/addons/effects/StereoEffect.js';
+
+const $ = id => document.getElementById(id);
+const PREFIX = 'sssrvr-';
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('sssr_' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('sssr_' + k, JSON.stringify(v)); } catch {} }
+};
+function show(id) { document.querySelectorAll('.screen').forEach(s => s.classList.toggle('on', s.id === id)); }
+
+$('goPc').onclick = () => { show('pc'); startPc(); };
+$('goPhone').onclick = () => { show('phone'); };
+
+// ======================================================================
+//                               ПК: ТРЕКЕР
+// ======================================================================
+function startPc() {
+  const video = $('video'), maskView = $('maskView'), mctx = maskView.getContext('2d');
+  const proc = document.createElement('canvas'), pctx = proc.getContext('2d', { willReadFrequently: true });
+  const conns = new Set();
+
+  // ---- настройки ----
+  const S = {
+    hueTol: store.get('hueTol', 0.08), minSat: store.get('minSat', 0.35), minVal: store.get('minVal', 0.25),
+    calDist: store.get('calDist', 0.4), smooth: store.get('smooth', 0.5), fov: store.get('fov', 60),
+    facesUser: store.get('facesUser', false), mirror: store.get('mirror', false),
+    color: store.get('color', [26, 230, 51]), refL: store.get('refL', -1), refR: store.get('refR', -1),
+  };
+  let targetHue = rgb2hsv(...S.color)[0];
+
+  for (const k of ['hueTol', 'minSat', 'minVal', 'calDist', 'smooth', 'fov']) {
+    const el = $(k), out = el.nextElementSibling;
+    el.value = S[k]; out.textContent = el.value;
+    el.oninput = () => { S[k] = +el.value; out.textContent = el.value; store.set(k, S[k]); };
+  }
+  for (const k of ['facesUser', 'mirror']) {
+    $(k).checked = S[k];
+    $(k).onchange = () => { S[k] = $(k).checked; store.set(k, S[k]); applyMirror(); };
+  }
+  function applyMirror() {
+    // вебка напротив - превью как в зеркале, так привычнее
+    const flip = S.facesUser !== S.mirror;
+    video.style.transform = maskView.style.transform = flip ? 'scaleX(-1)' : '';
+  }
+  applyMirror();
+  const swatch = () => $('colorSwatch').style.background = `rgb(${S.color.join(',')})`;
+  swatch();
+
+  // ---- связь ----
+  const code = String(Math.floor(1000 + Math.random() * 9000));
+  const peer = new Peer(PREFIX + code);
+  peer.on('open', () => { $('code').textContent = code; setStatus('Жду телефон…', ''); });
+  peer.on('connection', c => {
+    c.on('open', () => { conns.add(c); setStatus('Телефон подключён (' + conns.size + ')', 'ok'); });
+    c.on('close', () => { conns.delete(c); setStatus(conns.size ? 'Телефон подключён (' + conns.size + ')' : 'Телефон отключился', conns.size ? 'ok' : 'bad'); });
+  });
+  peer.on('error', e => setStatus('Ошибка связи: ' + e.type + (e.type === 'unavailable-id' ? ' — обнови страницу' : ''), 'bad'));
+  function setStatus(t, cls) { const s = $('status'); s.textContent = t; s.className = cls || 'muted'; }
+
+  // ---- вебка ----
+  async function openCam(deviceId) {
+    if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: deviceId ? { exact: deviceId } : undefined, width: 640, height: 480 }, audio: false });
+    video.srcObject = stream; await video.play();
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+    const sel = $('camSel'), cur = stream.getVideoTracks()[0].getSettings().deviceId;
+    sel.innerHTML = devs.map((d, i) => `<option value="${d.deviceId}" ${d.deviceId === cur ? 'selected' : ''}>${d.label || 'Камера ' + (i + 1)}</option>`).join('');
+  }
+  $('camSel').onchange = e => openCam(e.target.value);
+  openCam().catch(e => setStatus('Нет доступа к вебке: ' + e.message, 'bad'));
+
+  // ---- выбор цвета кликом ----
+  video.onclick = e => {
+    if (!proc.width) return;
+    let x = e.offsetX / video.clientWidth, y = e.offsetY / video.clientHeight;
+    if (video.style.transform) x = 1 - x;
+    const px = Math.floor(x * proc.width), py = Math.floor(y * proc.height);
+    const d = pctx.getImageData(Math.max(0, px - 2), Math.max(0, py - 2), 5, 5).data;
+    let r = 0, g = 0, b = 0;
+    for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; }
+    const n = d.length / 4;
+    S.color = [r / n | 0, g / n | 0, b / n | 0];
+    targetHue = rgb2hsv(...S.color)[0];
+    store.set('color', S.color); swatch();
+  };
+
+  // ---- руки ----
+  const mk = () => ({ visible: false, tracked: false, pos: [0, 0, 0.4], ndc: [0, 0], area: 0, lost: 0, blob: 0 });
+  const L = mk(), R = mk();
+
+  $('calSize').onclick = calibrateSize;
+  addEventListener('keydown', e => { if (e.key === 'k' || e.key === 'K' || e.key === 'л' || e.key === 'Л') calibrateSize(); });
+  function calibrateSize() {
+    if (L.tracked) S.refL = L.area;
+    if (R.tracked) S.refR = R.area;
+    if (S.refL < 0 && S.refR > 0) S.refL = S.refR;
+    if (S.refR < 0 && S.refL > 0) S.refR = S.refL;
+    store.set('refL', S.refL); store.set('refR', S.refR);
+    setStatus('Размер запомнен', 'ok');
+  }
+
+  let mask, labels, stack, last = performance.now();
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = (now - last) / 1000; last = now;
+    if (video.readyState < 2 || !video.videoWidth) return;
+
+    const pw = 160, ph = Math.round(pw * video.videoHeight / video.videoWidth);
+    if (proc.width !== pw || proc.height !== ph) {
+      proc.width = maskView.width = pw; proc.height = maskView.height = ph;
+      mask = new Uint8Array(pw * ph); labels = new Int32Array(pw * ph); stack = new Int32Array(pw * ph);
+    }
+    pctx.drawImage(video, 0, 0, pw, ph);
+    const img = pctx.getImageData(0, 0, pw, ph), d = img.data;
+
+    // маска цвета
+    for (let i = 0, j = 0; i < mask.length; i++, j += 4) {
+      const [h, s, v] = rgb2hsv(d[j], d[j + 1], d[j + 2]);
+      let dh = Math.abs(h - targetHue); dh = Math.min(dh, 1 - dh);
+      mask[i] = (s >= S.minSat && v >= S.minVal && dh <= S.hueTol) ? 1 : 0;
+    }
+
+    // связные области
+    labels.fill(0);
+    const blobs = []; let id = 0;
+    for (let i = 0; i < mask.length; i++) {
+      if (!mask[i] || labels[i]) continue;
+      id++; let top = 0, cnt = 0, sx = 0, sy = 0;
+      stack[top++] = i; labels[i] = id;
+      while (top) {
+        const p = stack[--top], x = p % pw, y = (p / pw) | 0;
+        sx += x; sy += y; cnt++;
+        if (x > 0 && mask[p - 1] && !labels[p - 1]) { labels[p - 1] = id; stack[top++] = p - 1; }
+        if (x < pw - 1 && mask[p + 1] && !labels[p + 1]) { labels[p + 1] = id; stack[top++] = p + 1; }
+        if (y > 0 && mask[p - pw] && !labels[p - pw]) { labels[p - pw] = id; stack[top++] = p - pw; }
+        if (y < ph - 1 && mask[p + pw] && !labels[p + pw]) { labels[p + pw] = id; stack[top++] = p + pw; }
+      }
+      if (cnt >= 20) blobs.push({ cx: sx / cnt, cy: sy / cnt, n: cnt, id });
+    }
+    blobs.sort((a, b) => b.n - a.n); blobs.length = Math.min(blobs.length, 2);
+
+    // кто левый, кто правый
+    const ndcOf = b => {
+      let x = (b.cx + 0.5) / pw * 2 - 1;
+      if (S.mirror) x = -x;
+      return [x, -((b.cy + 0.5) / ph * 2 - 1)];
+    };
+    const dist2 = (a, b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2;
+    if (blobs.length === 2) {
+      const a = ndcOf(blobs[0]), b = ndcOf(blobs[1]);
+      const aLeft = (L.visible && R.visible)
+        ? dist2(a, L.ndc) + dist2(b, R.ndc) <= dist2(a, R.ndc) + dist2(b, L.ndc)
+        : a[0] <= b[0];
+      track(L, aLeft ? blobs[0] : blobs[1], S.refL, pw, ph);
+      track(R, aLeft ? blobs[1] : blobs[0], S.refR, pw, ph);
+    } else if (blobs.length === 1) {
+      const a = ndcOf(blobs[0]);
+      const isLeft = (L.visible && R.visible) ? dist2(a, L.ndc) <= dist2(a, R.ndc)
+                   : L.visible ? (dist2(a, L.ndc) < 0.25 || a[0] < 0)
+                   : R.visible ? !(dist2(a, R.ndc) < 0.25 || a[0] >= 0)
+                   : a[0] < 0;
+      if (isLeft) { track(L, blobs[0], S.refL, pw, ph); lost(R, dt); }
+      else { track(R, blobs[0], S.refR, pw, ph); lost(L, dt); }
+    } else { lost(L, dt); lost(R, dt); }
+
+    // маска на экран
+    const out = mctx.createImageData(pw, ph), o = out.data;
+    for (let i = 0, j = 0; i < mask.length; i++, j += 4) {
+      const l = labels[i];
+      const c = !mask[i] ? [0, 0, 0] : (l && l === L.blob) ? [255, 70, 70] : (l && l === R.blob) ? [70, 130, 255] : [90, 90, 90];
+      o[j] = c[0]; o[j + 1] = c[1]; o[j + 2] = c[2]; o[j + 3] = 255;
+    }
+    mctx.putImageData(out, 0, 0);
+
+    const f = h => h.visible ? `${h.tracked ? '●' : '○'} ${h.pos.map(v => v.toFixed(2)).join(' ')}` : '—';
+    $('handsInfo').textContent = `Л: ${f(L)}   П: ${f(R)}` + (S.refL < 0 ? '   (размер не откалиброван)' : '');
+
+    // отправка: [видна, отслеживается, x, y, z]
+    if (conns.size) {
+      const pack = h => [h.visible ? 1 : 0, h.tracked ? 1 : 0, +h.pos[0].toFixed(3), +h.pos[1].toFixed(3), +h.pos[2].toFixed(3)];
+      const msg = { l: pack(L), r: pack(R) };
+      for (const c of conns) if (c.open) c.send(msg);
+    }
+
+    function track(h, b, ref, pw, ph) {
+      const ndc = ndcOf(b), area = b.n / (pw * ph);
+      const ratio = ref > 0 ? Math.sqrt(ref / area) : 1;      // >1 - предмет дальше от вебки, чем при калибровке
+      let z = S.facesUser ? S.calDist / ratio * 1.5 : S.calDist * ratio;   // напротив: ближе к вебке = дальше от тебя
+      z = Math.min(1.5, Math.max(0.1, z));
+      const tanH = Math.tan(S.fov * Math.PI / 360), tanV = tanH * ph / pw;
+      const sx = S.facesUser ? -ndc[0] : ndc[0];
+      const p = [sx * tanH * z, ndc[1] * tanV * z, z];
+      const k = h.visible ? S.smooth : 0;
+      h.pos = h.pos.map((v, i) => v * k + p[i] * (1 - k));
+      h.ndc = ndc; h.area = area; h.blob = b.id;
+      h.visible = h.tracked = true; h.lost = 0;
+    }
+    function lost(h, dt) {
+      h.tracked = false; h.blob = 0; h.lost += dt;
+      if (h.lost > 0.3) h.visible = false;
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+function rgb2hsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  let h = 0;
+  if (d) {
+    if (mx === r) h = ((g - b) / d) % 6;
+    else if (mx === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h /= 6; if (h < 0) h += 1;
+  }
+  return [h, mx ? d / mx : 0, mx];
+}
+
+// ======================================================================
+//                              ТЕЛЕФОН: VR
+// ======================================================================
+let conn = null, hands = { l: [0, 0, 0, 0, 0.4], r: [0, 0, 0, 0, 0.4] };
+
+$('codeIn').value = store.get('code', '');
+$('connect').onclick = () => {
+  const code = $('codeIn').value.trim();
+  if (!/^\d{4}$/.test(code)) return vrStatus('Введи 4 цифры', 'bad');
+  store.set('code', code);
+  vrStatus('Подключаюсь…', '');
+  const peer = new Peer();
+  peer.on('open', () => {
+    conn = peer.connect(PREFIX + code);
+    conn.on('open', () => vrStatus('Подключено к ПК ✓', 'ok'));
+    conn.on('data', d => { if (d && d.l && d.r) hands = d; });
+    conn.on('close', () => vrStatus('ПК отключился', 'bad'));
+  });
+  peer.on('error', e => vrStatus('Ошибка: ' + (e.type === 'peer-unavailable' ? 'ПК с таким кодом не найден' : e.type), 'bad'));
+};
+function vrStatus(t, cls) { const s = $('vrStatus'); s.textContent = t; s.className = cls || 'muted'; }
+
+const ipdEl = $('ipd');
+ipdEl.value = store.get('ipd', 63); ipdEl.nextElementSibling.textContent = ipdEl.value;
+ipdEl.oninput = () => { ipdEl.nextElementSibling.textContent = ipdEl.value; store.set('ipd', +ipdEl.value); };
+$('stereo').checked = store.get('stereo', true);
+$('stereo').onchange = () => store.set('stereo', $('stereo').checked);
+
+let vrStarted = false;
+$('startVr').onclick = async () => {
+  // iOS: разрешение на гироскоп нужно спросить по нажатию
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission)
+      await DeviceOrientationEvent.requestPermission();
+  } catch {}
+  $('vr').classList.add('on');
+  try { await document.documentElement.requestFullscreen(); } catch {}
+  try { await screen.orientation.lock('landscape'); } catch {}
+  if (!vrStarted) { vrStarted = true; startVr(); }
+};
+$('exitVr').onclick = async () => {
+  $('vr').classList.remove('on');
+  try { await document.exitFullscreen(); } catch {}
+};
+
+function startVr() {
+  const box = $('vr');
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  box.prepend(renderer.domElement);
+  const stereo = new StereoEffect(renderer);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1d2733);
+  scene.fog = new THREE.Fog(0x1d2733, 8, 30);
+  const camera = new THREE.PerspectiveCamera(80, 1, 0.05, 100);
+  camera.position.set(0, 1.6, 0);
+  scene.add(camera);
+
+  scene.add(new THREE.HemisphereLight(0xcfe3ff, 0x2a2018, 0.9));
+  const sun = new THREE.DirectionalLight(0xfff1d6, 1.2); sun.position.set(3, 6, 2); scene.add(sun);
+
+  // пол и немного объектов вокруг
+  const grid = new THREE.GridHelper(40, 40, 0x4a5a6a, 0x2c3845); scene.add(grid);
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshLambertMaterial({ color: 0x24303c }));
+  floor.rotation.x = -Math.PI / 2; floor.position.y = -0.001; scene.add(floor);
+  const colors = [0xd23b3b, 0xe0a030, 0x3bb56a, 0x3b7bd2, 0x9b55d6];
+  for (let i = 0; i < 14; i++) {
+    const a = i / 14 * Math.PI * 2, r = 3 + (i % 3);
+    const m = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.6 + (i % 4) * 0.4, 0.6),
+                             new THREE.MeshLambertMaterial({ color: colors[i % colors.length] }));
+    m.position.set(Math.sin(a) * r, m.geometry.parameters.height / 2, -Math.cos(a) * r);
+    scene.add(m);
+  }
+
+  // руки - дети камеры: вебка на голове, позиции рук уже относительно головы
+  const handMat = c => new THREE.MeshLambertMaterial({ color: c, emissive: c, emissiveIntensity: 0.25 });
+  const handL = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.07, 0.07), handMat(0xff5050));
+  const handR = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.07, 0.07), handMat(0x4f8cff));
+  camera.add(handL, handR);
+
+  // ---- гироскоп -> поворот камеры ----
+  let ori = null, yawOffset = 0;
+  addEventListener('deviceorientation', e => { if (e.alpha !== null) ori = e; });
+  const zee = new THREE.Vector3(0, 0, 1), euler = new THREE.Euler(), q0 = new THREE.Quaternion();
+  const q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+  const qYaw = new THREE.Quaternion(), qDev = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0);
+  const deg = Math.PI / 180;
+  function deviceQuat(out) {
+    const angle = (screen.orientation ? screen.orientation.angle : window.orientation || 0) * deg;
+    euler.set(ori.beta * deg, ori.alpha * deg, -ori.gamma * deg, 'YXZ');
+    out.setFromEuler(euler).multiply(q1).multiply(q0.setFromAxisAngle(zee, -angle));
+    return out;
+  }
+  function recenter() {
+    if (!ori) { yawOffset = 0; return; }
+    const e = new THREE.Euler().setFromQuaternion(deviceQuat(qDev), 'YXZ');
+    yawOffset = -e.y;
+  }
+  $('recenter').onclick = recenter;
+
+  // без гироскопа (проверка на ПК): поворот пальцем / мышью
+  let dragYaw = 0, dragPitch = 0, dragging = false, px = 0, py = 0, moved = 0;
+  box.addEventListener('pointerdown', e => { dragging = true; px = e.clientX; py = e.clientY; moved = 0; });
+  addEventListener('pointerup', () => dragging = false);
+  addEventListener('pointermove', e => {
+    if (!dragging || ori) return;
+    dragYaw -= (e.clientX - px) * 0.005; dragPitch -= (e.clientY - py) * 0.005;
+    dragPitch = Math.max(-1.4, Math.min(1.4, dragPitch));
+    moved += Math.abs(e.clientX - px) + Math.abs(e.clientY - py);
+    px = e.clientX; py = e.clientY;
+  });
+
+  // тап - показать/скрыть кнопки, двойной тап - центр
+  let lastTap = 0, barTimer = 0;
+  const bar = $('vrBar');
+  box.addEventListener('click', e => {
+    if (e.target.tagName === 'BUTTON' || moved > 10) return;
+    const t = performance.now();
+    if (t - lastTap < 350) recenter();
+    lastTap = t;
+    bar.style.opacity = bar.style.opacity === '0' ? '1' : '0';
+    clearTimeout(barTimer); barTimer = setTimeout(() => bar.style.opacity = '0', 4000);
+  });
+  barTimer = setTimeout(() => bar.style.opacity = '0', 4000);
+
+  function resize() {
+    const w = box.clientWidth, h = box.clientHeight;
+    renderer.setSize(w, h); stereo.setSize(w, h);
+    camera.aspect = ($('stereo').checked ? w / 2 : w) / h; camera.updateProjectionMatrix();
+  }
+  addEventListener('resize', resize);
+  $('stereo').addEventListener('change', resize);
+
+  const tmpL = new THREE.Vector3(), tmpR = new THREE.Vector3();
+  function placeHand(mesh, d, tmp) {
+    mesh.visible = !!d[0];
+    if (!d[0]) return;
+    tmp.set(d[2], d[3] - 0.12, -d[4]);           // вебка на лбу: руки чуть ниже глаз; в three вперёд это -z
+    mesh.position.lerp(tmp, 0.5);
+    const grip = !d[1];                           // предмет закрыт ладонью - "хват"
+    mesh.material.emissiveIntensity = grip ? 1.0 : 0.25;
+    mesh.scale.setScalar(grip ? 0.7 : 1);
+  }
+
+  renderer.setAnimationLoop(() => {
+    if (!box.classList.contains('on')) return;
+    if (box.clientWidth && (renderer.domElement.width === 0)) resize();
+    if (ori) {
+      deviceQuat(qDev);
+      qYaw.setFromAxisAngle(Y, yawOffset);
+      camera.quaternion.copy(qYaw).multiply(qDev);
+    } else {
+      camera.quaternion.setFromEuler(new THREE.Euler(dragPitch, dragYaw, 0, 'YXZ'));
+    }
+    placeHand(handL, hands.l, tmpL);
+    placeHand(handR, hands.r, tmpR);
+
+    if ($('stereo').checked) {
+      stereo.setEyeSeparation(+ipdEl.value / 1000);
+      stereo.render(scene, camera);
+    } else {
+      renderer.setViewport(0, 0, box.clientWidth, box.clientHeight);
+      renderer.render(scene, camera);
+    }
+  });
+  resize();
+  setTimeout(resize, 300);
+}
+</script>
+</body>
+</html>
