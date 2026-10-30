@@ -101,7 +101,7 @@
 </div>
 
 <div id="vr">
-  <div id="vrBar"><button id="recenter">⟳ Центр</button><button id="exitVr">✕ Выход</button></div>
+  <div id="vrBar"><button id="recenter">⟳ Центр</button><button id="gyroInfo">gyro ?</button><button id="exitVr">✕ Выход</button></div>
 </div>
 
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
@@ -415,8 +415,18 @@ function startVr() {
   camera.add(handL, handR);
 
   // ---- гироскоп -> поворот камеры ----
-  let ori = null, yawOffset = 0;
-  addEventListener('deviceorientation', e => { if (e.alpha !== null) ori = e; });
+  let ori = null, yawOffset = 0, gyroEvents = 0, gyroKind = '';
+  // разные браузеры шлют разное: absolute (компас) надёжнее, но есть не везде
+  function onOri(kind) {
+    return e => {
+      if (e.alpha === null || e.alpha === undefined) return;
+      // пришло absolute - не даём обычному его перебить
+      if (gyroKind === 'absolute' && kind !== 'absolute') return;
+      ori = e; gyroKind = kind; gyroEvents++;
+    };
+  }
+  addEventListener('deviceorientationabsolute', onOri('absolute'));
+  addEventListener('deviceorientation', onOri('relative'));
   const zee = new THREE.Vector3(0, 0, 1), euler = new THREE.Euler(), q0 = new THREE.Quaternion();
   const q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
   const qYaw = new THREE.Quaternion(), qDev = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0);
@@ -433,6 +443,18 @@ function startVr() {
     yawOffset = -e.y;
   }
   $('recenter').onclick = recenter;
+
+  // показывает, идут ли данные гироскопа (видно прямо в VR)
+  const gi = $('gyroInfo');
+  gi.onclick = () => {
+    alert(ori
+      ? `Гироскоп: ${gyroKind}\nсобытий: ${gyroEvents}\nalpha ${ori.alpha?.toFixed(0)}  beta ${ori.beta?.toFixed(0)}  gamma ${ori.gamma?.toFixed(0)}`
+      : `Данных нет.\nСобытий: ${gyroEvents}\nСтраница: ${location.protocol}\nПроверь: https, разрешение датчиков в настройках сайта, отключён ли "Поворот экрана"-блок.`);
+  };
+  setInterval(() => {
+    gi.textContent = ori ? `gyro ${gyroKind === 'absolute' ? 'A' : 'R'} ${ori.alpha | 0}/${ori.beta | 0}/${ori.gamma | 0}` : 'gyro ✕ (мышь)';
+    gi.style.color = ori ? 'var(--accent)' : 'var(--warn)';
+  }, 300);
 
   // без гироскопа (проверка на ПК): поворот пальцем / мышью
   let dragYaw = 0, dragPitch = 0, dragging = false, px = 0, py = 0, moved = 0;
