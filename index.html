@@ -78,7 +78,8 @@
     <h2>Голова</h2>
     <label class="s">Угол обзора камеры <input type="range" id="camFov" min="40" max="110" step="1" value="68"><span></span></label>
     <label class="s">Усиление поворота <input type="range" id="headGain" min="1" max="6" step="0.1" value="2.5"><span></span></label>
-    <label class="s">Наклон вбок <input type="range" id="rollGain" min="0" max="1" step="0.05" value="0"><span></span></label>
+    <label class="s">Порог красного <input type="range" id="redThr" min="0.2" max="0.8" step="0.02" value="0.42"><span></span></label>
+
   </div>
 
   <div class="card">
@@ -97,7 +98,7 @@
 </div>
 
 <div id="markerScreen">
-  <div class="mk" id="mk_l"></div><div class="mk" id="mk_r"></div>
+  <div class="mk" id="mk_c"></div>
   <div id="mkHint">Маркеры для телефона. Выход — клик или Esc</div>
 </div>
 
@@ -143,12 +144,9 @@ $('goPhone').onclick = () => { show('phone'); startCam(); };
 //                         МОНИТОР: ПЯТЬ МАРКЕРОВ
 // ======================================================================
 // Зелёного среди них нет специально: зелёный занят карандашами-джойстиками.
-// Два красных пятна на чёрном: камера находит их даже при плохом свете,
-// а разный размер позволяет понять, какое из них левое, когда второе ушло из кадра.
-const MK = [
-  { id: 'l', name: 'левый',  k: 1.0, pos: 'left:3%;top:50%;transform:translateY(-50%)' },
-  { id: 'r', name: 'правый', k: 0.6, pos: 'right:3%;top:50%;transform:translateY(-50%)' },
-];
+// Один красный квадрат по центру чёрного экрана: его видно даже в темноте,
+// он не путается с руками и не перекрывается ими.
+const MK = [{ id: 'c', name: 'маркер', k: 1, pos: 'left:50%;top:50%;transform:translate(-50%,-50%)' }];
 const mkSize = slider('mkSize', 'mkSize', 13, v => v + '%');
 function layoutMarkers() {
   const side = Math.round(Math.min(innerWidth, innerHeight) * mkSize() / 100);
@@ -176,7 +174,7 @@ addEventListener('resize', () => { if ($('markerScreen').classList.contains('on'
 const GREEN_HUE = 0.33;          // карандаши
 const camFov = slider('camFov', 'camFov', 68, v => v + '°');
 const headGain = slider('headGain', 'headGain', 2.5, v => v + '×');
-const rollGain = slider('rollGain', 'rollGain', 0);
+const redThr = slider('redThr', 'redThr', 0.42);
 const handDist = slider('handDist', 'handDist', 0.4, v => v + ' м');
 const greenTol = slider('greenTol', 'greenTol', 0.07);
 const ipd = slider('ipd', 'ipd', 63);
@@ -185,13 +183,12 @@ $('stereo').onchange = () => store.set('stereo', $('stereo').checked);
 
 // ---- поворот головы по маркерам ----
 const head = {
-  found: {}, count: 0, ok: false, lost: 0, lastArea: 0, span: 0,
-  yaw: 0, pitch: 0, roll: 0,
-  zeroYaw: 0, zeroPitch: 0, zeroRoll: 0,
-  center() { this.zeroYaw = this.yaw; this.zeroPitch = this.pitch; this.zeroRoll = this.roll; },
+  found: {}, count: 0, ok: false, lost: 0, size: 0,
+  yaw: 0, pitch: 0,
+  zeroYaw: 0, zeroPitch: 0,
+  center() { this.zeroYaw = this.yaw; this.zeroPitch = this.pitch; },
   get y() { return this.yaw - this.zeroYaw; },
   get p() { return this.pitch - this.zeroPitch; },
-  get r() { return this.roll - this.zeroRoll; },
 
   solve(pw, ph, dt) {
     const F = this.found, pts = Object.values(F);
@@ -201,28 +198,14 @@ const head = {
       return;
     }
     const f = (pw / 2) / Math.tan(camFov() * deg / 2);          // фокус в пикселях
-    let cx, cy;
-    if (F.l && F.r) {                                           // видны оба - центр между ними
-      cx = (F.l.x + F.r.x) / 2; cy = (F.l.y + F.r.y) / 2;
-      this.span = Math.hypot(F.r.x - F.l.x, F.r.y - F.l.y);
-    } else {
-      // виден один - достраиваем центр по запомненному расстоянию между маркерами
-      const p = F.l || F.r, half = (this.span || pw * 0.5) / 2;
-      cx = p.x + (F.l ? half : -half); cy = p.y;
-    }
-    const yaw = Math.atan2(cx - pw / 2, f) / deg;               // экран ушёл вправо = голова повернулась влево
-    const pitch = Math.atan2(cy - ph / 2, f) / deg;
+    const m = F.c;
+    const yaw = Math.atan2(m.x - pw / 2, f) / deg;              // маркер ушёл вправо = голова повернулась влево
+    const pitch = Math.atan2(m.y - ph / 2, f) / deg;
+    this.size = Math.sqrt(m.n);                                 // по размеру видно, далеко ли монитор
 
-    let roll = this.roll;
-    if (F.l && F.r) {
-      const dx = F.r.x - F.l.x, dy = F.r.y - F.l.y;
-      // при сильном повороте пара кажется наклонённой из-за перспективы - такому крену не верим
-      if (Math.abs(dx) > pw * 0.25 && Math.abs(dy) < Math.abs(dx) * 0.7) roll = -Math.atan2(dy, dx) / deg;
-    }
-    const k = this.ok ? 0.45 : 1;
+    const k = this.ok ? 0.45 : 1;                               // сглаживаем дрожание
     this.yaw += (yaw - this.yaw) * k;
     this.pitch += (pitch - this.pitch) * k;
-    this.roll += (roll - this.roll) * k;
     this.ok = true; this.lost = 0;
   }
 };
@@ -291,7 +274,9 @@ function parse(d, pw, ph, dt) {
     const r = d[j] / 255, g = d[j + 1] / 255, b = d[j + 2] / 255;
     const mx = Math.max(r, g, b);
     if (mx < 0.3) continue;                                  // тёмное
-    if (r > 0.35 && r - Math.max(g, b) > 0.22) { redMask[i] = 1; continue; }
+    const red = r - Math.max(g, b);
+    // чистый красный с экрана даёт ~0.9, тёплая стена или лампа - 0.2..0.3
+    if (r > 0.35 && red > redThr()) { redMask[i] = Math.min(255, Math.round(red * 255)); continue; }
     const mn = Math.min(r, g, b), dl = mx - mn;
     if (dl / mx < 0.4) continue;                             // блёклое
     let h;
@@ -303,19 +288,20 @@ function parse(d, pw, ph, dt) {
     if (dg <= tol) mask[i] = 1;                              // карандаш
   }
 
-  const red = blobs(redMask, pw, ph, 8, 2);                  // два самых крупных красных пятна
-  head.found = {};
-  if (red.length === 2) {
-    const [a2, b2] = red[0].cx <= red[1].cx ? [red[0], red[1]] : [red[1], red[0]];
-    head.found.l = a2; head.found.r = b2;
-  } else if (red.length === 1) {
-    // один маркер: какой именно - подсказывает его размер (левый крупнее)
-    const p = red[0];
-    const guessLeft = head.lastArea > 0 ? p.n > head.lastArea * 0.8 : p.cx < pw / 2;
-    head.found[guessLeft ? 'l' : 'r'] = p;
+  // берём самое насыщенное пятно, похожее на квадрат: окно и тёплые стены так отсеиваются
+  const red = blobs(redMask, pw, ph, 6, 8);
+  let best = null;
+  for (const p of red) {
+    const w = p.maxx - p.minx + 1, h = p.maxy - p.miny + 1;
+    const ratio = w / h, fill = p.n / (w * h);
+    if (ratio < 0.45 || ratio > 2.2 || fill < 0.5) continue;   // не квадрат - мимо
+    if (p.n > n * 0.2) continue;                                // пол-кадра - это не маркер
+    const avg = p.sum / p.n;                                    // насколько пятно чисто-красное
+    const score = avg * Math.sqrt(p.n);                         // яркий цвет важнее большой площади
+    if (!best || score > best.score) best = { ...p, score };
   }
-  head.count = Object.keys(head.found).length;
-  if (head.found.l) head.lastArea = head.found.l.n;
+  head.found = best ? { c: best } : {};
+  head.count = best ? 1 : 0;
   head.solve(pw, ph, dt);
   findHands(pw, ph, dt);
   drawDebug(pw, ph);
@@ -327,17 +313,20 @@ function blobs(m, pw, ph, minPix, max) {
   const out = []; let id = 0;
   for (let i = 0; i < m.length; i++) {
     if (!m[i] || labels[i]) continue;
-    id++; let top = 0, cnt = 0, sx = 0, sy = 0;
+    id++; let top = 0, cnt = 0, sx = 0, sy = 0, sum = 0;
+    let minx = 1e9, maxx = -1, miny = 1e9, maxy = -1;
     stack[top++] = i; labels[i] = id;
     while (top) {
       const p = stack[--top], x = p % pw, y = (p / pw) | 0;
-      sx += x; sy += y; cnt++;
+      sx += x; sy += y; cnt++; sum += m[p];
+      if (x < minx) minx = x; if (x > maxx) maxx = x;
+      if (y < miny) miny = y; if (y > maxy) maxy = y;
       if (x > 0 && m[p - 1] && !labels[p - 1]) { labels[p - 1] = id; stack[top++] = p - 1; }
       if (x < pw - 1 && m[p + 1] && !labels[p + 1]) { labels[p + 1] = id; stack[top++] = p + 1; }
       if (y > 0 && m[p - pw] && !labels[p - pw]) { labels[p - pw] = id; stack[top++] = p - pw; }
       if (y < ph - 1 && m[p + pw] && !labels[p + pw]) { labels[p + pw] = id; stack[top++] = p + pw; }
     }
-    if (cnt >= minPix) out.push({ cx: sx / cnt, cy: sy / cnt, x: sx / cnt, y: sy / cnt, n: cnt, id });
+    if (cnt >= minPix) out.push({ cx: sx / cnt, cy: sy / cnt, x: sx / cnt, y: sy / cnt, n: cnt, id, sum, minx, maxx, miny, maxy });
   }
   out.sort((a, b) => b.n - a.n);
   out.length = Math.min(out.length, max);
@@ -405,7 +394,7 @@ function drawDebug(pw, ph) {
   for (const m of MK) {
     const f = head.found[m.id];
     if (!f) continue;
-    dbg.fillStyle = m.id === 'l' ? '#fff' : '#ffd24a';
+    dbg.fillStyle = '#fff';
     dbg.beginPath(); dbg.arc(f.x, f.y, 3.5, 0, 6.3); dbg.fill();
   }
 }
@@ -413,7 +402,7 @@ function drawDebug(pw, ph) {
 setInterval(() => {
   const el = $('seeInfo');
   if (!el || !cam.on) return;
-  const seen = MK.filter(m => head.found[m.id]).map(m => m.name).join(', ') || 'нет';
+  const seen = head.found.c ? 'виден' : 'нет';
   const hl = hands.L.visible ? (hands.L.tracked ? '●' : '○') : '—';
   const hr = hands.R.visible ? (hands.R.tracked ? '●' : '○') : '—';
   el.textContent = `Маркеры: ${seen}. Голова ${head.y.toFixed(0)}°/${head.p.toFixed(0)}°. Руки ${hl} ${hr}`
@@ -477,14 +466,14 @@ function startVr() {
 
   const ti = $('trackInfo');
   ti.onclick = () => {
-    const seen = MK.map(m => (head.found[m.id] ? '✓ ' : '✕ ') + m.name).join('\n');
+    const seen = head.found.c ? '✓ маркер виден' : '✕ маркера не видно';
     alert(`Камера: ${cam.on ? 'работает' : (cam.err || 'выключена')}\n\n${seen}\n\n` +
-          `поворот ${head.y.toFixed(1)}°, наклон ${head.p.toFixed(1)}°, крен ${head.r.toFixed(1)}°\n` +
+          `поворот ${head.y.toFixed(1)}°, наклон ${head.p.toFixed(1)}°\n` +
           `руки: ${hands.L.visible ? 'левая есть' : 'левой нет'}, ${hands.R.visible ? 'правая есть' : 'правой нет'}`);
   };
   setInterval(() => {
     ti.textContent = !cam.on ? 'камера ✕'
-                   : head.ok ? `${head.count}/2  ${head.y | 0}°/${head.p | 0}°`
+                   : head.ok ? `${head.y | 0}°/${head.p | 0}°`
                    : 'маркеров не видно';
     ti.style.color = head.ok ? 'var(--accent)' : 'var(--warn)';
   }, 300);
@@ -567,7 +556,7 @@ function startVr() {
     if (box.clientWidth && renderer.domElement.width === 0) resize();
 
     camera.quaternion.setFromEuler(new THREE.Euler(
-      head.p * deg * headGain(), head.y * deg * headGain(), head.r * deg * rollGain(), 'YXZ'));
+      head.p * deg * headGain(), head.y * deg * headGain(), 0, 'YXZ'));
 
     placeHand(handL, hands.L, tmpL);
     placeHand(handR, hands.R, tmpR);
