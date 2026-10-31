@@ -63,9 +63,12 @@
   <div class="card">
     <div class="row">
       <button id="calSize" class="main">Запомнить размер (K)</button>
+      <button id="scanRoom">🧭 Снять комнату (360°)</button>
+      <button id="clearRoom">Сброс</button>
       <select id="camSel"></select>
     </div>
     <div class="muted">Держи оба предмета на расстоянии «калибровки» от вебки и нажми «Запомнить размер».</div>
+    <div class="muted" id="roomInfo">Компас: комната не снята. Надень вебку на лоб, нажми «Снять комнату» и медленно повернись на 360°.</div>
     <div class="row">
       <label><input type="checkbox" id="facesUser"> Вебка смотрит на меня (стоит напротив)</label>
       <label><input type="checkbox" id="mirror"> Отзеркалить</label>
@@ -247,35 +250,142 @@ function startPc() {
       return { shift: best, err: bestErr };
     },
 
+    // ---- визуальный компас: панорама комнаты по кругу ----
+    // Углы, дверь, окно, потолок - у каждого направления свой "отпечаток" цвета и яркости.
+    // Один раз снимаем круг, дальше узнаём направление по картинке, без накопления ошибки.
+    pano: { N: 720, lum: null, chr: null, filled: null, recording: false, cover: 0, err: 0, locked: false },
+
+    panoInit(load) {
+      const P = this.pano;
+      P.lum = new Float32Array(P.N); P.chr = new Float32Array(P.N); P.filled = new Uint8Array(P.N);
+      P.cover = 0; P.locked = false;
+      if (load) {
+        try {
+          const raw = JSON.parse(localStorage.getItem('sssr_pano') || 'null');
+          if (raw && raw.N === P.N) {
+            P.lum.set(raw.lum); P.chr.set(raw.chr); P.filled.set(raw.filled);
+            P.cover = raw.filled.reduce((a, b) => a + b, 0) / P.N;
+          }
+        } catch {}
+      }
+    },
+    panoSave() {
+      const P = this.pano;
+      try {
+        localStorage.setItem('sssr_pano', JSON.stringify({
+          N: P.N, lum: Array.from(P.lum, v => +v.toFixed(1)),
+          chr: Array.from(P.chr, v => +v.toFixed(1)), filled: Array.from(P.filled) }));
+      } catch {}
+    },
+    bin(angle) { const N = this.pano.N; return ((Math.round(angle / 360 * N) % N) + N) % N; },
+
+    panoWrite(lum, chr, pw, fovH) {       // записать текущий вид в панораму
+      const P = this.pano, dpp = fovH / pw;
+      for (let x = 0; x < pw; x++) {
+        const b = this.bin(this.yaw + (x - pw / 2) * dpp);
+        if (P.filled[b]) { P.lum[b] = P.lum[b] * 0.6 + lum[x] * 0.4; P.chr[b] = P.chr[b] * 0.6 + chr[x] * 0.4; }
+        else { P.lum[b] = lum[x]; P.chr[b] = chr[x]; P.filled[b] = 1; P.cover += 1 / P.N; }
+      }
+    },
+
+    panoMatch(lum, chr, pw, fovH) {       // где в панораме мы сейчас
+      const P = this.pano, dpp = fovH / pw, step = 2;
+      let best = null, bestErr = Infinity;
+      for (let c = 0; c < P.N; c += 2) {
+        let err = 0, cnt = 0;
+        for (let x = 0; x < pw; x += step) {
+          const b = (c + Math.round((x - pw / 2) * dpp / 360 * P.N) % P.N + P.N) % P.N;
+          if (!P.filled[b]) continue;
+          err += Math.abs(P.lum[b] - lum[x]) + Math.abs(P.chr[b] - chr[x]) * 1.5;
+          cnt++;
+        }
+        if (cnt < pw / step * 0.5) continue;
+        err /= cnt;
+        if (err < bestErr) { bestErr = err; best = c; }
+      }
+      return best === null ? null : { yaw: best / P.N * 360, err: bestErr };
+    },
+
     update(d, mask, pw, ph, fovH) {
-      const col = new Float32Array(pw), row = new Float32Array(ph);
+      const col = new Float32Array(pw), chr = new Float32Array(pw), row = new Float32Array(ph);
       const colN = new Float32Array(pw), rowN = new Float32Array(ph);
       for (let y = 0, i = 0; y < ph; y++)
         for (let x = 0; x < pw; x++, i++) {
           if (mask[i]) continue;          // руки не считаем
-          const j = i * 4, v = d[j] * 0.3 + d[j + 1] * 0.59 + d[j + 2] * 0.11;
-          col[x] += v; colN[x]++; row[y] += v; rowN[y]++;
+          const j = i * 4, r = d[j], g = d[j + 1], b = d[j + 2];
+          const v = r * 0.3 + g * 0.59 + b * 0.11;
+          col[x] += v; colN[x]++;
+          chr[x] += (r - b) * 0.5 + 128;  // цветность: окно холодное, дверь тёплая
+          row[y] += v; rowN[y]++;
         }
-      for (let x = 0; x < pw; x++) col[x] = colN[x] ? col[x] / colN[x] : 0;
+      for (let x = 0; x < pw; x++) { const n = colN[x] || 1; col[x] /= n; chr[x] /= n; }
       for (let y = 0; y < ph; y++) row[y] = rowN[y] ? row[y] / rowN[y] : 0;
 
+      // 1) быстрый относительный поворот - по сдвигу кадра
       if (this.prevCol) {
         const maxS = Math.max(4, pw >> 4);
         const sx = this.shift(col, this.prevCol, maxS);
         const sy = this.shift(row, this.prevRow, maxS);
         this.quality = sx.err;
-        // при резком изменении кадра (свет, кто-то прошёл) сдвигу не верим
-        if (sx.err < 24) {
+        if (sx.err < 24) {                // резкая смена кадра - сдвигу не верим
           const degPerPx = fovH / pw;
           this.yaw += sx.shift * degPerPx;             // картинка уехала влево = голова повернулась вправо
           this.pitch += sy.shift * degPerPx;
-          this.yaw = ((this.yaw + 180) % 360 + 360) % 360 - 180;
           this.pitch = Math.max(-70, Math.min(70, this.pitch));
         }
       }
       this.prevCol = col; this.prevRow = row;
+      this.yaw = ((this.yaw % 360) + 360) % 360;
+
+      // 2) привязка к панораме - убирает накопленную ошибку
+      const P = this.pano;
+      if (P.recording) {
+        this.panoWrite(col, chr, pw, fovH);
+      } else if (P.cover > 0.5 && (this.tick = (this.tick | 0) + 1) % 3 === 0) {
+        const m = this.panoMatch(col, chr, pw, fovH);
+        if (m) {
+          P.err = m.err;
+          P.locked = m.err < 18;
+          if (P.locked) {
+            let diff = ((m.yaw - this.yaw + 540) % 360) - 180;   // кратчайший путь по кругу
+            this.yaw += diff * (Math.abs(diff) > 25 ? 0.5 : 0.12);
+            this.yaw = ((this.yaw % 360) + 360) % 360;
+          }
+        }
+      }
     }
   };
+  head.panoInit(true);
+
+  // ---- запись панорамы комнаты ----
+  let scanTimer = 0;
+  $('scanRoom').onclick = () => {
+    const P = head.pano;
+    if (P.recording) { stopScan(); return; }
+    head.panoInit(false); head.yaw = 0;
+    P.recording = true;
+    $('scanRoom').textContent = '⏹ Стоп (идёт съёмка)';
+    clearTimeout(scanTimer);
+    scanTimer = setTimeout(stopScan, 60000);
+  };
+  function stopScan() {
+    const P = head.pano;
+    P.recording = false;
+    clearTimeout(scanTimer);
+    $('scanRoom').textContent = '🧭 Снять комнату (360°)';
+    head.panoSave();
+  }
+  $('clearRoom').onclick = () => {
+    try { localStorage.removeItem('sssr_pano'); } catch {}
+    head.panoInit(false); stopScan();
+  };
+  setInterval(() => {
+    const P = head.pano, el = $('roomInfo');
+    if (S.facesUser) { el.textContent = 'Компас выключен: вебка стоит напротив, а не на лбу.'; return; }
+    if (P.recording) el.textContent = `Съёмка: ${(P.cover * 100) | 0}% круга. Поворачивайся медленно, пока не станет ~95%.`;
+    else if (P.cover > 0.5) el.textContent = `Компас: ${P.locked ? 'привязан ✓' : 'ищет…'}  (снято ${(P.cover * 100) | 0}%, расхождение ${P.err.toFixed(0)})`;
+    else el.textContent = 'Компас: комната не снята. Надень вебку на лоб, нажми «Снять комнату» и медленно повернись на 360°.';
+  }, 300);
 
   let mask, labels, stack, last = performance.now();
   function frame(now) {
