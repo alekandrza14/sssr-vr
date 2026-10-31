@@ -437,23 +437,98 @@ function startVr() {
     out.setFromEuler(euler).multiply(q1).multiply(q0.setFromAxisAngle(zee, -angle));
     return out;
   }
+  // ---- запасной путь: devicemotion (акселерометр + гироскоп, без компаса) ----
+  // Нужен телефонам, которые не шлют deviceorientation (нет магнитометра).
+  // Наклон берём из гравитации, поворот влево/вправо - из гироскопа (медленно уплывает, лечится "Центром").
+  const motion = {
+    events: 0, hasRate: false, hasGrav: false, ready: false,
+    q: new THREE.Quaternion(),            // device -> world (Z вверх), как в deviceorientation
+    g: new THREE.Vector3(0, 0, 1),
+    rate: new THREE.Vector3(),            // рад/с по осям устройства
+    last: 0,
+    _dq: new THREE.Quaternion(), _axis: new THREE.Vector3(), _v: new THREE.Vector3(),
+    _up: new THREE.Vector3(0, 0, 1), _err: new THREE.Vector3(), _qc: new THREE.Quaternion(),
+
+    onEvent(e) {
+      const a = e.accelerationIncludingGravity, r = e.rotationRate;
+      if (a && a.x !== null) {
+        this.hasGrav = true;
+        this._v.set(a.x, a.y, a.z);
+        if (this._v.lengthSq() > 1) {
+          this._v.normalize();
+          this.g.lerp(this._v, 0.2);      // сглаживаем дрожание
+          if (!this.ready) { this.initFromGravity(); this.ready = true; }
+        }
+      }
+      if (r && r.alpha !== null) {
+        this.hasRate = true;
+        this.rate.set(r.beta || 0, r.gamma || 0, r.alpha || 0).multiplyScalar(deg);
+      }
+      this.events++;
+    },
+
+    initFromGravity() {                   // поворот, переводящий измеренную гравитацию в "вверх"
+      this.q.setFromUnitVectors(this._v.clone().normalize(), this._up);
+    },
+
+    update(dt) {
+      if (!this.ready) return;
+      dt = Math.min(dt, 0.1);
+      if (this.hasRate) {                 // интегрируем угловую скорость
+        const w = this.rate, len = w.length();
+        if (len > 1e-4) {
+          this._axis.copy(w).divideScalar(len);
+          this._dq.setFromAxisAngle(this._axis, len * dt);
+          this.q.multiply(this._dq);
+        }
+      }
+      // держим горизонт по гравитации: иначе картинка уплывает
+      this._v.copy(this.g).applyQuaternion(this.q);
+      this._err.crossVectors(this._v, this._up);
+      const s = this._err.length();
+      if (s > 1e-5) {
+        this._axis.copy(this._err).divideScalar(s);
+        this._qc.setFromAxisAngle(this._axis, Math.asin(Math.min(s, 1)) * (this.hasRate ? 0.08 : 0.5));
+        this.q.premultiply(this._qc);
+      }
+      this.q.normalize();
+    },
+
+    toCamera(out) {                       // device -> камера three.js, с учётом поворота экрана
+      const angle = (screen.orientation ? screen.orientation.angle : window.orientation || 0) * deg;
+      return out.copy(this.q).multiply(q1).multiply(q0.setFromAxisAngle(zee, -angle));
+    }
+  };
+  addEventListener('devicemotion', e => motion.onEvent(e));
+
+  function headQuat(out) {                // текущий поворот головы, откуда бы он ни пришёл
+    if (ori) return deviceQuat(out);
+    if (motion.ready) return motion.toCamera(out);
+    return null;
+  }
+
   function recenter() {
-    if (!ori) { yawOffset = 0; return; }
-    const e = new THREE.Euler().setFromQuaternion(deviceQuat(qDev), 'YXZ');
+    const q = headQuat(qDev);
+    if (!q) { yawOffset = 0; dragYaw = 0; dragPitch = 0; return; }
+    const e = new THREE.Euler().setFromQuaternion(q, 'YXZ');
     yawOffset = -e.y;
+    dragYaw = 0;
   }
   $('recenter').onclick = recenter;
 
   // показывает, идут ли данные гироскопа (видно прямо в VR)
   const gi = $('gyroInfo');
   gi.onclick = () => {
-    alert(ori
-      ? `Гироскоп: ${gyroKind}\nсобытий: ${gyroEvents}\nalpha ${ori.alpha?.toFixed(0)}  beta ${ori.beta?.toFixed(0)}  gamma ${ori.gamma?.toFixed(0)}`
-      : `Данных нет.\nСобытий: ${gyroEvents}\nСтраница: ${location.protocol}\nПроверь: https, разрешение датчиков в настройках сайта, отключён ли "Поворот экрана"-блок.`);
+    if (ori) alert(`Датчик: deviceorientation (${gyroKind})\nсобытий: ${gyroEvents}\nalpha ${ori.alpha?.toFixed(0)}  beta ${ori.beta?.toFixed(0)}  gamma ${ori.gamma?.toFixed(0)}`);
+    else if (motion.ready) alert(`Датчик: devicemotion\nсобытий: ${motion.events}\nгироскоп: ${motion.hasRate ? 'есть' : 'НЕТ (повороты - пальцем)'}\nакселерометр: ${motion.hasGrav ? 'есть' : 'нет'}\n\nЕсли картинка уплывает - жми "Центр".`);
+    else alert(`Данных нет.\norientation: ${gyroEvents}, motion: ${motion.events}\nСтраница: ${location.protocol}\n\nПохоже, в телефоне нет датчиков или браузер их не отдаёт. Крути вид пальцем.`);
   };
   setInterval(() => {
-    gi.textContent = ori ? `gyro ${gyroKind === 'absolute' ? 'A' : 'R'} ${ori.alpha | 0}/${ori.beta | 0}/${ori.gamma | 0}` : 'gyro ✕ (мышь)';
-    gi.style.color = ori ? 'var(--accent)' : 'var(--warn)';
+    const t = ori ? `gyro ${gyroKind === 'absolute' ? 'A' : 'R'} ${ori.alpha | 0}/${ori.beta | 0}/${ori.gamma | 0}`
+            : motion.ready ? `motion ${motion.hasRate ? '✓' : '± палец'}`
+            : 'нет датчиков (палец)';
+    gi.textContent = t;
+    gi.style.color = (ori || motion.ready) ? 'var(--accent)' : 'var(--warn)';
   }, 300);
 
   // без гироскопа (проверка на ПК): поворот пальцем / мышью
@@ -489,6 +564,7 @@ function startVr() {
   addEventListener('resize', resize);
   $('stereo').addEventListener('change', resize);
 
+  let lastFrame = performance.now();
   const tmpL = new THREE.Vector3(), tmpR = new THREE.Vector3();
   function placeHand(mesh, d, tmp) {
     mesh.visible = !!d[0];
@@ -503,10 +579,15 @@ function startVr() {
   renderer.setAnimationLoop(() => {
     if (!box.classList.contains('on')) return;
     if (box.clientWidth && (renderer.domElement.width === 0)) resize();
-    if (ori) {
-      deviceQuat(qDev);
-      qYaw.setFromAxisAngle(Y, yawOffset);
-      camera.quaternion.copy(qYaw).multiply(qDev);
+    const now = performance.now();
+    const dt = Math.min((now - lastFrame) / 1000, 0.1); lastFrame = now;
+    if (!ori && motion.ready) motion.update(dt);
+
+    const q = headQuat(qDev);
+    if (q) {
+      // без гироскопа повороты влево/вправо остаются за пальцем
+      qYaw.setFromAxisAngle(Y, yawOffset + (motion.ready && !motion.hasRate && !ori ? dragYaw : 0));
+      camera.quaternion.copy(qYaw).multiply(q);
     } else {
       camera.quaternion.setFromEuler(new THREE.Euler(dragPitch, dragYaw, 0, 'YXZ'));
     }
