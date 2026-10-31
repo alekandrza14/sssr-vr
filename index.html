@@ -121,6 +121,7 @@
     <label class="s">Ширина, м <input type="range" id="rw" min="1.5" max="8" step="0.1" value="3.4"><span></span></label>
     <label class="s">Длина, м <input type="range" id="rd" min="1.5" max="8" step="0.1" value="4"><span></span></label>
     <label class="s">Высота, м <input type="range" id="rh" min="2" max="4" step="0.05" value="2.7"><span></span></label>
+    <label class="s">Поворот комнаты, ° <input type="range" id="ryaw" min="0" max="355" step="5" value="0"><span></span></label>
     <div class="row">
       <button id="dlRoom">⬇ Скачать room.zip</button>
       <label class="filebtn">📦 Открыть room.zip<input type="file" id="roomZip" accept=".zip,.obj" hidden></label>
@@ -135,7 +136,7 @@
 </div>
 
 <div id="vr">
-  <div id="vrBar"><button id="recenter">⟳ Центр</button><button id="voiceInfo">🎤</button><button id="gyroInfo">gyro ?</button><button id="exitVr">✕ Выход</button></div>
+  <div id="vrBar"><button id="recenter">⟳ Центр</button><button id="turnRoom">⟲ Комната 90°</button><button id="voiceInfo">🎤</button><button id="gyroInfo">gyro ?</button><button id="exitVr">✕ Выход</button></div>
 </div>
 
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
@@ -650,20 +651,35 @@ setInterval(() => {
 // ======================================================================
 // Комната - коробка из 6 фотографий. Их можно снять прямо телефоном,
 // сохранить в браузере и отдать другим одним файлом room.zip.
+// Стандарт имён файлов: +z вперёд, -z назад, +x вправо, -x влево, +y вверх, -y вниз.
+// Расширение любое. Старые имена (front/north/...) тоже понимаем.
 const FACES = [
-  { id: 'front',   label: 'Впереди', keys: ['front', 'north'] },
-  { id: 'right',   label: 'Справа',  keys: ['right', 'east'] },
-  { id: 'back',    label: 'Сзади',   keys: ['back', 'south'] },
-  { id: 'left',    label: 'Слева',   keys: ['left', 'west'] },
-  { id: 'floor',   label: 'Пол',     keys: ['floor', 'ground'] },
-  { id: 'ceiling', label: 'Потолок', keys: ['ceil', 'roof'] },
+  { id: '+z', label: 'Впереди +z', keys: ['+z', 'front', 'north'] },
+  { id: '+x', label: 'Справа +x',  keys: ['+x', 'right', 'east'] },
+  { id: '-z', label: 'Сзади -z',   keys: ['-z', 'back', 'south'] },
+  { id: '-x', label: 'Слева -x',   keys: ['-x', 'left', 'west'] },
+  { id: '-y', label: 'Пол -y',     keys: ['-y', 'floor', 'ground', 'bottom'] },
+  { id: '+y', label: 'Потолок +y', keys: ['+y', 'ceil', 'roof', 'top'] },
 ];
 const roomPics = {};                  // id -> dataURL
 let roomModel = null, onRoomLoaded = null;
 
+let roomYaw = store.get('roomYaw', 0);    // разворот модели под реальную комнату
+function setRoomYaw(deg) {
+  roomYaw = ((deg % 360) + 360) % 360;
+  store.set('roomYaw', roomYaw);
+  const el = $('ryaw');
+  if (el) { el.value = roomYaw; el.nextElementSibling.textContent = roomYaw + '°'; }
+  if (roomModel) roomModel.rotation.y = roomYaw * Math.PI / 180;
+}
+
 const roomDims = {
   get w() { return +$('rw').value; }, get d() { return +$('rd').value; }, get h() { return +$('rh').value; }
 };
+$('ryaw').value = roomYaw;
+$('ryaw').nextElementSibling.textContent = roomYaw + '°';
+$('ryaw').oninput = () => setRoomYaw(+$('ryaw').value);
+
 for (const k of ['rw', 'rd', 'rh']) {
   const el = $(k); el.value = store.get('dim_' + k, el.value);
   el.nextElementSibling.textContent = el.value;
@@ -723,14 +739,15 @@ function buildRoom() {
   if (!FACES.some(f => roomPics[f.id])) return null;
   const W = roomDims.w, D = roomDims.d, H = roomDims.h;
   const g = new THREE.Group();
-  const geo = { front: [W, H], back: [W, H], right: [D, H], left: [D, H], floor: [W, D], ceiling: [W, D] };
+  // "вперёд" у пользователя = +z, а камера three.js смотрит в -Z, поэтому передняя грань там
+  const geo = { '+z': [W, H], '-z': [W, H], '+x': [D, H], '-x': [D, H], '-y': [W, D], '+y': [W, D] };
   const put = {
-    front:   m => { m.position.set(0, H / 2, -D / 2); },
-    back:    m => { m.position.set(0, H / 2, D / 2); m.rotation.y = Math.PI; },
-    right:   m => { m.position.set(W / 2, H / 2, 0); m.rotation.y = -Math.PI / 2; },
-    left:    m => { m.position.set(-W / 2, H / 2, 0); m.rotation.y = Math.PI / 2; },
-    floor:   m => { m.position.set(0, 0, 0); m.rotation.x = -Math.PI / 2; },
-    ceiling: m => { m.position.set(0, H, 0); m.rotation.x = Math.PI / 2; },
+    '+z': m => { m.position.set(0, H / 2, -D / 2); },
+    '-z': m => { m.position.set(0, H / 2, D / 2); m.rotation.y = Math.PI; },
+    '+x': m => { m.position.set(W / 2, H / 2, 0); m.rotation.y = -Math.PI / 2; },
+    '-x': m => { m.position.set(-W / 2, H / 2, 0); m.rotation.y = Math.PI / 2; },
+    '-y': m => { m.position.set(0, 0, 0); m.rotation.x = -Math.PI / 2; },
+    '+y': m => { m.position.set(0, H, 0); m.rotation.x = Math.PI / 2; },
   };
   for (const f of FACES) {
     const [a, b] = geo[f.id];
@@ -746,7 +763,23 @@ function buildRoom() {
 function rebuildRoom() {
   const m = buildRoom();
   roomModel = m;
+  if (m) m.rotation.y = roomYaw * Math.PI / 180;
   if (onRoomLoaded) onRoomLoaded(m);
+}
+
+// какая картинка из архива относится к этой грани
+function pickFace(files, f) {
+  const pics = files.filter(x => /\.(jpe?g|png|webp|bmp|gif)$/i.test(x.name));
+  const base = x => x.name.toLowerCase().replace(/^.*[\\/]/, '').replace(/\.[^.]+$/, '');
+  for (const k of f.keys) {                 // сначала точное имя файла (+z.jpg)
+    const hit = pics.find(x => base(x) === k);
+    if (hit) return hit;
+  }
+  for (const k of f.keys.slice(1)) {        // потом по вхождению (north_window.jpg)
+    const hit = pics.find(x => base(x).includes(k));
+    if (hit) return hit;
+  }
+  return null;
 }
 
 // ---- room.zip: читаем ----
@@ -787,8 +820,19 @@ $('roomZip').onchange = async e => {
   $('objInfo').textContent = 'Читаю архив…';
   try {
     const files = await readZip(file);
-    const obj = files.find(f => /\.obj$/i.test(f.name));
-    if (obj) {                           // размеры берём из модели
+    const cfg = files.find(f => /room\.json$/i.test(f.name));
+    if (cfg) {
+      try {
+        const j = JSON.parse(new TextDecoder().decode(cfg.data));
+        if (j.w) $('rw').value = j.w;
+        if (j.d) $('rd').value = j.d;
+        if (j.h) $('rh').value = j.h;
+        for (const k of ['rw', 'rd', 'rh']) { $(k).nextElementSibling.textContent = $(k).value; store.set('dim_' + k, +$(k).value); }
+        if (typeof j.yaw === 'number') setRoomYaw(j.yaw);
+      } catch {}
+    }
+    const obj = !cfg && files.find(f => /\.obj$/i.test(f.name));
+    if (obj) {                           // старый формат: размеры из модели
       const txt = new TextDecoder().decode(obj.data);
       const xs = [], ys = [], zs = [];
       for (const line of txt.split('\n'))
@@ -801,8 +845,7 @@ $('roomZip').onchange = async e => {
     }
     let n = 0;
     for (const f of FACES) {
-      const img = files.find(x => /\.(jpg|jpeg|png|webp)$/i.test(x.name) &&
-                                  f.keys.some(k => x.name.toLowerCase().includes(k)));
+      const img = pickFace(files, f);
       if (!img) continue;
       roomPics[f.id] = await shrink(new Blob([img.data]), 768);
       n++;
@@ -851,27 +894,10 @@ $('dlRoom').onclick = async () => {
     const b = await (await fetch(roomPics[f.id])).arrayBuffer();
     entries.push({ name: f.id + '.jpg', data: new Uint8Array(b) });
   }
-  // OBJ рядом - чтобы комнату можно было открыть и в любом 3D-редакторе
-  const W = roomDims.w, H = roomDims.h, D = roomDims.d, hw = W / 2, hd = D / 2;
-  const quads = {
-    front:   [[-hw, 0, -hd], [hw, 0, -hd], [hw, H, -hd], [-hw, H, -hd]],
-    back:    [[hw, 0, hd], [-hw, 0, hd], [-hw, H, hd], [hw, H, hd]],
-    right:   [[hw, 0, -hd], [hw, 0, hd], [hw, H, hd], [hw, H, -hd]],
-    left:    [[-hw, 0, hd], [-hw, 0, -hd], [-hw, H, -hd], [-hw, H, hd]],
-    floor:   [[-hw, 0, hd], [hw, 0, hd], [hw, 0, -hd], [-hw, 0, -hd]],
-    ceiling: [[-hw, H, -hd], [hw, H, -hd], [hw, H, hd], [-hw, H, hd]],
-  };
-  const uv = [[0, 0], [1, 0], [1, 1], [0, 1]];
-  let obj = `# Комната ${W} x ${D} м, высота ${H} м\nmtllib room.mtl\no Room\n`, mtl = '';
-  let vi = 1;
-  for (const f of have) {
-    for (const v of quads[f.id]) obj += `v ${v.join(' ')}\n`;
-    for (const t of uv) obj += `vt ${t.join(' ')}\n`;
-    obj += `usemtl ${f.id}\nf ` + [0, 1, 2, 3].map(k => `${vi + k}/${vi + k}`).join(' ') + '\n';
-    mtl += `newmtl ${f.id}\nKd 1 1 1\nmap_Kd ${f.id}.jpg\n\n`;
-    vi += 4;
-  }
-  entries.push({ name: 'room.obj', data: enc.encode(obj) }, { name: 'room.mtl', data: enc.encode(mtl) });
+  // размеры рядом с картинками - этого достаточно, модель собирается из имён
+  entries.push({ name: 'room.json', data: enc.encode(JSON.stringify(
+    { w: roomDims.w, d: roomDims.d, h: roomDims.h, yaw: roomYaw,
+      note: '+z вперёд, -z назад, +x вправо, -x влево, +y вверх, -y вниз' }, null, 2)) });
 
   const a = document.createElement('a');
   a.href = URL.createObjectURL(makeZip(entries));
@@ -891,7 +917,7 @@ loadRoom(); drawSlots(); rebuildRoom();
     const files = await readZip(new Blob([await r.arrayBuffer()]));
     let n = 0;
     for (const f of FACES) {
-      const img = files.find(x => /\.(jpg|jpeg|png|webp)$/i.test(x.name) && f.keys.some(k => x.name.toLowerCase().includes(k)));
+      const img = pickFace(files, f);
       if (img) { roomPics[f.id] = await shrink(new Blob([img.data]), 768); n++; }
     }
     if (n) { drawSlots(); rebuildRoom(); $('objInfo').textContent = `Комната с сайта: ${n} граней`; }
@@ -1085,6 +1111,8 @@ function startVr() {
     qZero.copy(q).invert();
   }
   $('recenter').onclick = recenter;
+  // комната встала не той стеной - доворачиваем её прямо в очках
+  $('turnRoom').onclick = () => { setRoomYaw(roomYaw + 90); $('turnRoom').textContent = '⟲ ' + roomYaw + '°'; };
 
   // показывает, идут ли данные гироскопа (видно прямо в VR)
   const gi = $('gyroInfo');
