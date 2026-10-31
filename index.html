@@ -507,6 +507,7 @@ function startVr() {
   const zee = new THREE.Vector3(0, 0, 1), euler = new THREE.Euler(), q0 = new THREE.Quaternion();
   const q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
   const qYaw = new THREE.Quaternion(), qDev = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0);
+  const qZero = new THREE.Quaternion();   // куда смотрел телефон в момент "Центра"
   const deg = Math.PI / 180;
   function deviceQuat(out) {
     const angle = (screen.orientation ? screen.orientation.angle : window.orientation || 0) * deg;
@@ -593,13 +594,14 @@ function startVr() {
     return null;
   }
 
+  // "Центр": текущее положение телефона becomes "смотрю вперёд".
+  // Поэтому неважно, как телефон лежит в коробке и как браузер трактует оси.
   function recenter() {
     camHead.zeroYaw = camHead.yaw; camHead.zeroPitch = camHead.pitch;
+    dragYaw = 0; dragPitch = 0;
     const q = headQuat(qDev);
-    if (!q) { yawOffset = 0; dragYaw = 0; dragPitch = 0; return; }
-    const e = new THREE.Euler().setFromQuaternion(q, 'YXZ');
-    yawOffset = -e.y;
-    dragYaw = 0;
+    if (!q) { qZero.identity(); return; }
+    qZero.copy(q).invert();
   }
   $('recenter').onclick = recenter;
 
@@ -735,11 +737,11 @@ function startVr() {
     if (q) {
       // наклон берём с датчика телефона, поворот вбок - с вебки или пальцем
       const extra = (ori || motion.hasRate) ? 0 : (webLive ? webYaw : dragYaw);
-      qYaw.setFromAxisAngle(Y, yawOffset + extra);
-      camera.quaternion.copy(qYaw).multiply(q);
+      qYaw.setFromAxisAngle(Y, extra);
+      camera.quaternion.copy(qYaw).multiply(qZero).multiply(q);
     } else if (webLive) {
       camera.quaternion.setFromEuler(new THREE.Euler(
-        -(camHead.pitch - camHead.zeroPitch) * deg + dragPitch, webYaw + yawOffset, 0, 'YXZ'));
+        -(camHead.pitch - camHead.zeroPitch) * deg + dragPitch, webYaw, 0, 'YXZ'));
     } else {
       camera.quaternion.setFromEuler(new THREE.Euler(dragPitch, dragYaw, 0, 'YXZ'));
     }
@@ -756,6 +758,8 @@ function startVr() {
   });
   resize();
   setTimeout(resize, 300);
+  // первая автоцентровка, когда датчики успели дать данные
+  setTimeout(recenter, 1200);
 }
 </script>
 </body>
