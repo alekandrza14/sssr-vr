@@ -97,9 +97,7 @@
 </div>
 
 <div id="markerScreen">
-  <div class="mk" id="mk_tl"></div><div class="mk" id="mk_tr"></div>
-  <div class="mk" id="mk_c"></div>
-  <div class="mk" id="mk_bl"></div><div class="mk" id="mk_br"></div>
+  <div class="mk" id="mk_l"></div><div class="mk" id="mk_r"></div>
   <div id="mkHint">Маркеры для телефона. Выход — клик или Esc</div>
 </div>
 
@@ -145,17 +143,19 @@ $('goPhone').onclick = () => { show('phone'); startCam(); };
 //                         МОНИТОР: ПЯТЬ МАРКЕРОВ
 // ======================================================================
 // Зелёного среди них нет специально: зелёный занят карандашами-джойстиками.
+// Два красных пятна на чёрном: камера находит их даже при плохом свете,
+// а разный размер позволяет понять, какое из них левое, когда второе ушло из кадра.
 const MK = [
-  { id: 'tl', css: '#0026ff', hue: 0.64, name: 'синий',      pos: 'left:3%;top:4%' },
-  { id: 'tr', css: '#00ffff', hue: 0.50, name: 'циан',       pos: 'right:3%;top:4%' },
-  { id: 'c',  css: '#ffffff', white: true, name: 'белый',    pos: 'left:50%;top:50%;transform:translate(-50%,-50%)' },
-  { id: 'bl', css: '#ff0000', hue: 0.00, name: 'красный',    pos: 'left:3%;bottom:4%' },
-  { id: 'br', css: '#b400ff', hue: 0.78, name: 'фиолетовый', pos: 'right:3%;bottom:4%' },
+  { id: 'l', name: 'левый',  k: 1.0, pos: 'left:3%;top:50%;transform:translateY(-50%)' },
+  { id: 'r', name: 'правый', k: 0.6, pos: 'right:3%;top:50%;transform:translateY(-50%)' },
 ];
 const mkSize = slider('mkSize', 'mkSize', 13, v => v + '%');
 function layoutMarkers() {
   const side = Math.round(Math.min(innerWidth, innerHeight) * mkSize() / 100);
-  for (const m of MK) $('mk_' + m.id).style.cssText = m.pos + `;width:${side}px;height:${side}px;background:${m.css}`;
+  for (const m of MK) {
+    const w = Math.round(side * m.k);
+    $('mk_' + m.id).style.cssText = m.pos + `;width:${w}px;height:${w}px;background:#ff0000`;
+  }
 }
 $('mkSize').addEventListener('input', () => { if ($('markerScreen').classList.contains('on')) layoutMarkers(); });
 $('showMarkers').onclick = async () => {
@@ -185,7 +185,7 @@ $('stereo').onchange = () => store.set('stereo', $('stereo').checked);
 
 // ---- поворот головы по маркерам ----
 const head = {
-  found: {}, count: 0, ok: false, lost: 0,
+  found: {}, count: 0, ok: false, lost: 0, lastArea: 0, span: 0,
   yaw: 0, pitch: 0, roll: 0,
   zeroYaw: 0, zeroPitch: 0, zeroRoll: 0,
   center() { this.zeroYaw = this.yaw; this.zeroPitch = this.pitch; this.zeroRoll = this.roll; },
@@ -195,23 +195,28 @@ const head = {
 
   solve(pw, ph, dt) {
     const F = this.found, pts = Object.values(F);
-    if (pts.length < 2) {
+    if (pts.length < 1) {
       this.lost += dt;
       if (this.lost > 0.5) this.ok = false;
       return;
     }
     const f = (pw / 2) / Math.tan(camFov() * deg / 2);          // фокус в пикселях
-    // центр: белый маркер надёжнее всего, иначе среднее по найденным
-    const cx = F.c ? F.c.x : pts.reduce((a, p) => a + p.x, 0) / pts.length;
-    const cy = F.c ? F.c.y : pts.reduce((a, p) => a + p.y, 0) / pts.length;
+    let cx, cy;
+    if (F.l && F.r) {                                           // видны оба - центр между ними
+      cx = (F.l.x + F.r.x) / 2; cy = (F.l.y + F.r.y) / 2;
+      this.span = Math.hypot(F.r.x - F.l.x, F.r.y - F.l.y);
+    } else {
+      // виден один - достраиваем центр по запомненному расстоянию между маркерами
+      const p = F.l || F.r, half = (this.span || pw * 0.5) / 2;
+      cx = p.x + (F.l ? half : -half); cy = p.y;
+    }
     const yaw = Math.atan2(cx - pw / 2, f) / deg;               // экран ушёл вправо = голова повернулась влево
     const pitch = Math.atan2(cy - ph / 2, f) / deg;
 
     let roll = this.roll;
-    const pair = (F.tl && F.tr) ? [F.tl, F.tr] : (F.bl && F.br) ? [F.bl, F.br] : null;
-    if (pair) {
-      const dx = pair[1].x - pair[0].x, dy = pair[1].y - pair[0].y;
-      // при сильном повороте прямоугольник экрана кажется наклонённым - такому крену не верим
+    if (F.l && F.r) {
+      const dx = F.r.x - F.l.x, dy = F.r.y - F.l.y;
+      // при сильном повороте пара кажется наклонённой из-за перспективы - такому крену не верим
       if (Math.abs(dx) > pw * 0.25 && Math.abs(dy) < Math.abs(dx) * 0.7) roll = -Math.atan2(dy, dx) / deg;
     }
     const k = this.ok ? 0.45 : 1;
@@ -236,7 +241,7 @@ $('calHands').onclick = () => {
 
 // ---- камера и разбор кадра ----
 const cam = { on: false, err: '', video: null, pw: 128, ph: 96 };
-let mask, labels, stack, dbg, dbgData;
+let mask, redMask, labels, stack, dbg, dbgData;
 
 async function startCam() {
   if (cam.on) return true;
@@ -272,90 +277,96 @@ async function startCam() {
 
 // Один проход по кадру: красим пиксели в маркеры и в зелёный, дальше считаем голову и руки.
 function parse(d, pw, ph, dt) {
-  if (!mask || mask.length !== pw * ph) {
-    mask = new Uint8Array(pw * ph); labels = new Int32Array(pw * ph); stack = new Int32Array(pw * ph);
+  const n = pw * ph;
+  if (!mask || mask.length !== n) {
+    mask = new Uint8Array(n); redMask = new Uint8Array(n);
+    labels = new Int32Array(n); stack = new Int32Array(n);
   }
-  const acc = {};
-  for (const m of MK) acc[m.id] = { x: 0, y: 0, n: 0 };
-  mask.fill(0);
+  mask.fill(0); redMask.fill(0);
   const tol = greenTol();
 
-  for (let i = 0, j = 0; i < pw * ph; i++, j += 4) {
+  // Красный ищем по превышению над зелёным и синим - так он не теряется
+  // при автоподстройке баланса белого у камеры.
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
     const r = d[j] / 255, g = d[j + 1] / 255, b = d[j + 2] / 255;
-    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), dl = mx - mn;
-    if (mx < 0.35) continue;                       // тёмное
-    if (dl < 0.18) {                               // белое: только центральный маркер
-      if (mx > 0.75) { const a = acc.c; a.x += i % pw; a.y += (i / pw) | 0; a.n++; }
-      continue;
-    }
-    if (dl / mx < 0.4) continue;                   // блёклое
+    const mx = Math.max(r, g, b);
+    if (mx < 0.3) continue;                                  // тёмное
+    if (r > 0.35 && r - Math.max(g, b) > 0.22) { redMask[i] = 1; continue; }
+    const mn = Math.min(r, g, b), dl = mx - mn;
+    if (dl / mx < 0.4) continue;                             // блёклое
     let h;
     if (mx === r) h = ((g - b) / dl) % 6;
     else if (mx === g) h = (b - r) / dl + 2;
     else h = (r - g) / dl + 4;
     h /= 6; if (h < 0) h += 1;
-
     let dg = Math.abs(h - GREEN_HUE); dg = Math.min(dg, 1 - dg);
-    if (dg <= tol) { mask[i] = 1; continue; }      // карандаш
-
-    for (const m of MK) {
-      if (m.white) continue;
-      let dh = Math.abs(h - m.hue); dh = Math.min(dh, 1 - dh);
-      if (dh <= 0.06) { const a = acc[m.id]; a.x += i % pw; a.y += (i / pw) | 0; a.n++; break; }
-    }
+    if (dg <= tol) mask[i] = 1;                              // карандаш
   }
 
-  head.found = {}; head.count = 0;
-  for (const m of MK) {
-    const a = acc[m.id];
-    if (a.n < 6) continue;
-    head.found[m.id] = { x: a.x / a.n, y: a.y / a.n, n: a.n };
-    head.count++;
+  const red = blobs(redMask, pw, ph, 8, 2);                  // два самых крупных красных пятна
+  head.found = {};
+  if (red.length === 2) {
+    const [a2, b2] = red[0].cx <= red[1].cx ? [red[0], red[1]] : [red[1], red[0]];
+    head.found.l = a2; head.found.r = b2;
+  } else if (red.length === 1) {
+    // один маркер: какой именно - подсказывает его размер (левый крупнее)
+    const p = red[0];
+    const guessLeft = head.lastArea > 0 ? p.n > head.lastArea * 0.8 : p.cx < pw / 2;
+    head.found[guessLeft ? 'l' : 'r'] = p;
   }
+  head.count = Object.keys(head.found).length;
+  if (head.found.l) head.lastArea = head.found.l.n;
   head.solve(pw, ph, dt);
   findHands(pw, ph, dt);
   drawDebug(pw, ph);
 }
 
-// связные зелёные области -> две самые большие
-function findHands(pw, ph, dt) {
+// связные области маски: возвращает до max самых крупных
+function blobs(m, pw, ph, minPix, max) {
   labels.fill(0);
-  const blobs = []; let id = 0;
-  for (let i = 0; i < mask.length; i++) {
-    if (!mask[i] || labels[i]) continue;
+  const out = []; let id = 0;
+  for (let i = 0; i < m.length; i++) {
+    if (!m[i] || labels[i]) continue;
     id++; let top = 0, cnt = 0, sx = 0, sy = 0;
     stack[top++] = i; labels[i] = id;
     while (top) {
       const p = stack[--top], x = p % pw, y = (p / pw) | 0;
       sx += x; sy += y; cnt++;
-      if (x > 0 && mask[p - 1] && !labels[p - 1]) { labels[p - 1] = id; stack[top++] = p - 1; }
-      if (x < pw - 1 && mask[p + 1] && !labels[p + 1]) { labels[p + 1] = id; stack[top++] = p + 1; }
-      if (y > 0 && mask[p - pw] && !labels[p - pw]) { labels[p - pw] = id; stack[top++] = p - pw; }
-      if (y < ph - 1 && mask[p + pw] && !labels[p + pw]) { labels[p + pw] = id; stack[top++] = p + pw; }
+      if (x > 0 && m[p - 1] && !labels[p - 1]) { labels[p - 1] = id; stack[top++] = p - 1; }
+      if (x < pw - 1 && m[p + 1] && !labels[p + 1]) { labels[p + 1] = id; stack[top++] = p + 1; }
+      if (y > 0 && m[p - pw] && !labels[p - pw]) { labels[p - pw] = id; stack[top++] = p - pw; }
+      if (y < ph - 1 && m[p + pw] && !labels[p + pw]) { labels[p + pw] = id; stack[top++] = p + pw; }
     }
-    if (cnt >= 15) blobs.push({ cx: sx / cnt, cy: sy / cnt, n: cnt, id });
+    if (cnt >= minPix) out.push({ cx: sx / cnt, cy: sy / cnt, x: sx / cnt, y: sy / cnt, n: cnt, id });
   }
-  blobs.sort((a, b) => b.n - a.n); blobs.length = Math.min(blobs.length, 2);
+  out.sort((a, b) => b.n - a.n);
+  out.length = Math.min(out.length, max);
+  return out;
+}
+
+// связные зелёные области -> две самые большие
+function findHands(pw, ph, dt) {
+  const found = blobs(mask, pw, ph, 15, 2);
 
   const L = hands.L, R = hands.R;
   const ndcOf = b => [(b.cx + 0.5) / pw * 2 - 1, -((b.cy + 0.5) / ph * 2 - 1)];
   const d2 = (a, b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2;
 
-  if (blobs.length === 2) {
-    const a = ndcOf(blobs[0]), b = ndcOf(blobs[1]);
+  if (found.length === 2) {
+    const a = ndcOf(found[0]), b = ndcOf(found[1]);
     const aLeft = (L.visible && R.visible)
       ? d2(a, L.ndc) + d2(b, R.ndc) <= d2(a, R.ndc) + d2(b, L.ndc)
       : a[0] <= b[0];
-    track(L, aLeft ? blobs[0] : blobs[1], hands.refL, pw, ph);
-    track(R, aLeft ? blobs[1] : blobs[0], hands.refR, pw, ph);
-  } else if (blobs.length === 1) {
-    const a = ndcOf(blobs[0]);
+    track(L, aLeft ? found[0] : found[1], hands.refL, pw, ph);
+    track(R, aLeft ? found[1] : found[0], hands.refR, pw, ph);
+  } else if (found.length === 1) {
+    const a = ndcOf(found[0]);
     const isLeft = (L.visible && R.visible) ? d2(a, L.ndc) <= d2(a, R.ndc)
                  : L.visible ? (d2(a, L.ndc) < 0.25 || a[0] < 0)
                  : R.visible ? !(d2(a, R.ndc) < 0.25 || a[0] >= 0)
                  : a[0] < 0;
-    if (isLeft) { track(L, blobs[0], hands.refL, pw, ph); lose(R, dt); }
-    else { track(R, blobs[0], hands.refR, pw, ph); lose(L, dt); }
+    if (isLeft) { track(L, found[0], hands.refL, pw, ph); lose(R, dt); }
+    else { track(R, found[0], hands.refR, pw, ph); lose(L, dt); }
   } else { lose(L, dt); lose(R, dt); }
 
   function track(h, b, ref, pw, ph) {
@@ -378,11 +389,10 @@ function findHands(pw, ph, dt) {
 function drawDebug(pw, ph) {
   if (!dbgData) return;
   const o = dbgData.data;
-  const colorOf = id => id === 'tl' ? [40, 70, 255] : id === 'tr' ? [0, 230, 230]
-                 : id === 'bl' ? [255, 50, 50] : id === 'br' ? [190, 60, 255] : [255, 255, 255];
   o.fill(0);
   for (let i = 0; i < pw * ph; i++) {
     const j = i * 4;
+    if (redMask[i]) { o[j] = 200; o[j + 1] = 30; o[j + 2] = 30; }
     if (mask[i]) {
       const c = labels[i] === hands.L.blob && hands.L.blob ? [60, 255, 60]
               : labels[i] === hands.R.blob && hands.R.blob ? [220, 255, 60] : [60, 110, 60];
@@ -395,9 +405,8 @@ function drawDebug(pw, ph) {
   for (const m of MK) {
     const f = head.found[m.id];
     if (!f) continue;
-    const c = colorOf(m.id);
-    dbg.fillStyle = `rgb(${c.join(',')})`;
-    dbg.beginPath(); dbg.arc(f.x, f.y, 3, 0, 6.3); dbg.fill();
+    dbg.fillStyle = m.id === 'l' ? '#fff' : '#ffd24a';
+    dbg.beginPath(); dbg.arc(f.x, f.y, 3.5, 0, 6.3); dbg.fill();
   }
 }
 
@@ -475,7 +484,7 @@ function startVr() {
   };
   setInterval(() => {
     ti.textContent = !cam.on ? 'камера ✕'
-                   : head.ok ? `${head.count}/5  ${head.y | 0}°/${head.p | 0}°`
+                   : head.ok ? `${head.count}/2  ${head.y | 0}°/${head.p | 0}°`
                    : 'маркеров не видно';
     ti.style.color = head.ok ? 'var(--accent)' : 'var(--warn)';
   }, 300);
