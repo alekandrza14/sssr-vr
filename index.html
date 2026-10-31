@@ -27,6 +27,12 @@
   #vr.on { display:block; } #vr canvas { display:block; width:100%; height:100%; }
   #vrBar { position:absolute; left:0; right:0; top:0; display:flex; gap:6px; padding:6px; justify-content:center; transition:opacity .3s; }
   #vrBar button { padding:6px 10px; font-size:13px; background:#000b; }
+  .slots { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; margin:10px 0; }
+  .slot { position:relative; aspect-ratio:1; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:#0d1116; cursor:pointer; }
+  .slot img { width:100%; height:100%; object-fit:cover; display:block; }
+  .slot span { position:absolute; left:0; right:0; bottom:0; font-size:11px; text-align:center; background:#000a; padding:2px; }
+  .slot.empty::after { content:"+"; position:absolute; inset:0; display:grid; place-items:center; font-size:26px; color:var(--muted); }
+  .filebtn { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 12px; cursor:pointer; }
   @media (max-width:600px) { .views { grid-template-columns:1fr; } label.s { grid-template-columns:110px 1fr 46px; } }
 </style>
 </head>
@@ -99,6 +105,30 @@
       <label><input type="checkbox" id="webHead" checked> Поворот головы с вебки (если нет гироскопа)</label>
     </div>
     <label class="s">Расстояние глаз, мм <input type="range" id="ipd" min="50" max="75" step="1" value="63"><span></span></label>
+  </div>
+  <div class="card">
+    <div class="row"><label><input type="checkbox" id="phoneCam" checked> Поворот по камере телефона (компас по комнате)</label></div>
+    <div class="row">
+      <button id="scanRoomPhone">🧭 Снять комнату (360°)</button>
+      <button id="clearRoomPhone">Сброс</button>
+    </div>
+    <div class="muted" id="roomInfoPhone">Камера выключена</div>
+  </div>
+  <div class="card">
+    <h2 style="margin-top:0">Моя комната</h2>
+    <div class="muted">Сфотографируй 4 стены, пол и потолок — встань в центре и поворачивайся.</div>
+    <div id="roomSlots" class="slots"></div>
+    <label class="s">Ширина, м <input type="range" id="rw" min="1.5" max="8" step="0.1" value="3.4"><span></span></label>
+    <label class="s">Длина, м <input type="range" id="rd" min="1.5" max="8" step="0.1" value="4"><span></span></label>
+    <label class="s">Высота, м <input type="range" id="rh" min="2" max="4" step="0.05" value="2.7"><span></span></label>
+    <div class="row">
+      <button id="dlRoom">⬇ Скачать room.zip</button>
+      <label class="filebtn">📦 Открыть room.zip<input type="file" id="roomZip" accept=".zip,.obj" hidden></label>
+      <button id="clearRoomModel">Очистить</button>
+    </div>
+    <div class="muted" id="objInfo">Комната не задана — будет простая сцена.</div>
+  </div>
+  <div class="card">
     <div class="row"><button class="main" id="startVr">▶ Старт VR</button></div>
     <div class="muted">Поверни телефон горизонтально. Двойной тап в VR — выровнять взгляд вперёд. Тап — показать/скрыть кнопки.</div>
   </div>
@@ -130,6 +160,146 @@ function show(id) { document.querySelectorAll('.screen').forEach(s => s.classLis
 
 $('goPc').onclick = () => { show('pc'); startPc(); };
 $('goPhone').onclick = () => { show('phone'); };
+
+// Общий трекер поворота по картинке: сдвиг кадра + панорама-компас.
+// Используется и вебкой на ПК, и камерой телефона.
+function makeHeadTracker(who) {
+    // ---- поворот головы по сдвигу картинки (вебка на лбу = датчик поворота) ----
+    // Сравниваем профили яркости соседних кадров. Пиксели рук исключаем, они двигаются сами.
+    return {
+      yaw: 0, pitch: 0, prevCol: null, prevRow: null, quality: 0,
+      reset() { this.yaw = this.pitch = 0; },
+
+      shift(cur, prev, maxS) {              // сдвиг одного профиля, в пикселях
+        let best = 0, bestErr = Infinity, errM = 0, errP = 0;
+        const n = cur.length;
+        for (let s = -maxS; s <= maxS; s++) {
+          let err = 0, cnt = 0;
+          for (let i = Math.max(0, -s); i < Math.min(n, n - s); i++) { err += Math.abs(cur[i] - prev[i + s]); cnt++; }
+          if (!cnt) continue;
+          err /= cnt;
+          if (err < bestErr) { bestErr = err; best = s; }
+        }
+        // субпиксель: парабола по соседям лучшего сдвига
+        const at = s => {
+          let err = 0, cnt = 0;
+          for (let i = Math.max(0, -s); i < Math.min(n, n - s); i++) { err += Math.abs(cur[i] - prev[i + s]); cnt++; }
+          return cnt ? err / cnt : Infinity;
+        };
+        if (best > -maxS && best < maxS) {
+          errM = at(best - 1); errP = at(best + 1);
+          const d = errM - 2 * bestErr + errP;
+          if (d > 1e-6) best += 0.5 * (errM - errP) / d;
+        }
+        return { shift: best, err: bestErr };
+      },
+
+      // ---- визуальный компас: панорама комнаты по кругу ----
+      // Углы, дверь, окно, потолок - у каждого направления свой "отпечаток" цвета и яркости.
+      // Один раз снимаем круг, дальше узнаём направление по картинке, без накопления ошибки.
+      pano: { N: 720, lum: null, chr: null, filled: null, recording: false, cover: 0, err: 0, locked: false },
+
+      panoInit(load) {
+        const P = this.pano;
+        P.lum = new Float32Array(P.N); P.chr = new Float32Array(P.N); P.filled = new Uint8Array(P.N);
+        P.cover = 0; P.locked = false;
+        if (load) {
+          try {
+            const raw = JSON.parse(localStorage.getItem('sssr_pano_' + who) || 'null');
+            if (raw && raw.N === P.N) {
+              P.lum.set(raw.lum); P.chr.set(raw.chr); P.filled.set(raw.filled);
+              P.cover = raw.filled.reduce((a, b) => a + b, 0) / P.N;
+            }
+          } catch {}
+        }
+      },
+      panoSave() {
+        const P = this.pano;
+        try {
+          localStorage.setItem('sssr_pano_' + who, JSON.stringify({
+            N: P.N, lum: Array.from(P.lum, v => +v.toFixed(1)),
+            chr: Array.from(P.chr, v => +v.toFixed(1)), filled: Array.from(P.filled) }));
+        } catch {}
+      },
+      bin(angle) { const N = this.pano.N; return ((Math.round(angle / 360 * N) % N) + N) % N; },
+
+      panoWrite(lum, chr, pw, fovH) {       // записать текущий вид в панораму
+        const P = this.pano, dpp = fovH / pw;
+        for (let x = 0; x < pw; x++) {
+          const b = this.bin(this.yaw + (x - pw / 2) * dpp);
+          if (P.filled[b]) { P.lum[b] = P.lum[b] * 0.6 + lum[x] * 0.4; P.chr[b] = P.chr[b] * 0.6 + chr[x] * 0.4; }
+          else { P.lum[b] = lum[x]; P.chr[b] = chr[x]; P.filled[b] = 1; P.cover += 1 / P.N; }
+        }
+      },
+
+      panoMatch(lum, chr, pw, fovH) {       // где в панораме мы сейчас
+        const P = this.pano, dpp = fovH / pw, step = 2;
+        let best = null, bestErr = Infinity;
+        for (let c = 0; c < P.N; c += 2) {
+          let err = 0, cnt = 0;
+          for (let x = 0; x < pw; x += step) {
+            const b = (c + Math.round((x - pw / 2) * dpp / 360 * P.N) % P.N + P.N) % P.N;
+            if (!P.filled[b]) continue;
+            err += Math.abs(P.lum[b] - lum[x]) + Math.abs(P.chr[b] - chr[x]) * 1.5;
+            cnt++;
+          }
+          if (cnt < pw / step * 0.5) continue;
+          err /= cnt;
+          if (err < bestErr) { bestErr = err; best = c; }
+        }
+        return best === null ? null : { yaw: best / P.N * 360, err: bestErr };
+      },
+
+      update(d, mask, pw, ph, fovH) {
+        const col = new Float32Array(pw), chr = new Float32Array(pw), row = new Float32Array(ph);
+        const colN = new Float32Array(pw), rowN = new Float32Array(ph);
+        for (let y = 0, i = 0; y < ph; y++)
+          for (let x = 0; x < pw; x++, i++) {
+            if (mask[i]) continue;          // руки не считаем
+            const j = i * 4, r = d[j], g = d[j + 1], b = d[j + 2];
+            const v = r * 0.3 + g * 0.59 + b * 0.11;
+            col[x] += v; colN[x]++;
+            chr[x] += (r - b) * 0.5 + 128;  // цветность: окно холодное, дверь тёплая
+            row[y] += v; rowN[y]++;
+          }
+        for (let x = 0; x < pw; x++) { const n = colN[x] || 1; col[x] /= n; chr[x] /= n; }
+        for (let y = 0; y < ph; y++) row[y] = rowN[y] ? row[y] / rowN[y] : 0;
+
+        // 1) быстрый относительный поворот - по сдвигу кадра
+        if (this.prevCol) {
+          const maxS = Math.max(4, pw >> 4);
+          const sx = this.shift(col, this.prevCol, maxS);
+          const sy = this.shift(row, this.prevRow, maxS);
+          this.quality = sx.err;
+          if (sx.err < 24) {                // резкая смена кадра - сдвигу не верим
+            const degPerPx = fovH / pw;
+            this.yaw += sx.shift * degPerPx;             // картинка уехала влево = голова повернулась вправо
+            this.pitch += sy.shift * degPerPx;
+            this.pitch = Math.max(-70, Math.min(70, this.pitch));
+          }
+        }
+        this.prevCol = col; this.prevRow = row;
+        this.yaw = ((this.yaw % 360) + 360) % 360;
+
+        // 2) привязка к панораме - убирает накопленную ошибку
+        const P = this.pano;
+        if (P.recording) {
+          this.panoWrite(col, chr, pw, fovH);
+        } else if (P.cover > 0.5 && (this.tick = (this.tick | 0) + 1) % 3 === 0) {
+          const m = this.panoMatch(col, chr, pw, fovH);
+          if (m) {
+            P.err = m.err;
+            P.locked = m.err < 18;
+            if (P.locked) {
+              let diff = ((m.yaw - this.yaw + 540) % 360) - 180;   // кратчайший путь по кругу
+              this.yaw += diff * (Math.abs(diff) > 25 ? 0.5 : 0.12);
+              this.yaw = ((this.yaw % 360) + 360) % 360;
+            }
+          }
+        }
+      }
+    };
+}
 
 // ======================================================================
 //                               ПК: ТРЕКЕР
@@ -220,141 +390,7 @@ function startPc() {
     setStatus('Размер запомнен', 'ok');
   }
 
-  // ---- поворот головы по сдвигу картинки (вебка на лбу = датчик поворота) ----
-  // Сравниваем профили яркости соседних кадров. Пиксели рук исключаем, они двигаются сами.
-  const head = {
-    yaw: 0, pitch: 0, prevCol: null, prevRow: null, quality: 0,
-    reset() { this.yaw = this.pitch = 0; },
-
-    shift(cur, prev, maxS) {              // сдвиг одного профиля, в пикселях
-      let best = 0, bestErr = Infinity, errM = 0, errP = 0;
-      const n = cur.length;
-      for (let s = -maxS; s <= maxS; s++) {
-        let err = 0, cnt = 0;
-        for (let i = Math.max(0, -s); i < Math.min(n, n - s); i++) { err += Math.abs(cur[i] - prev[i + s]); cnt++; }
-        if (!cnt) continue;
-        err /= cnt;
-        if (err < bestErr) { bestErr = err; best = s; }
-      }
-      // субпиксель: парабола по соседям лучшего сдвига
-      const at = s => {
-        let err = 0, cnt = 0;
-        for (let i = Math.max(0, -s); i < Math.min(n, n - s); i++) { err += Math.abs(cur[i] - prev[i + s]); cnt++; }
-        return cnt ? err / cnt : Infinity;
-      };
-      if (best > -maxS && best < maxS) {
-        errM = at(best - 1); errP = at(best + 1);
-        const d = errM - 2 * bestErr + errP;
-        if (d > 1e-6) best += 0.5 * (errM - errP) / d;
-      }
-      return { shift: best, err: bestErr };
-    },
-
-    // ---- визуальный компас: панорама комнаты по кругу ----
-    // Углы, дверь, окно, потолок - у каждого направления свой "отпечаток" цвета и яркости.
-    // Один раз снимаем круг, дальше узнаём направление по картинке, без накопления ошибки.
-    pano: { N: 720, lum: null, chr: null, filled: null, recording: false, cover: 0, err: 0, locked: false },
-
-    panoInit(load) {
-      const P = this.pano;
-      P.lum = new Float32Array(P.N); P.chr = new Float32Array(P.N); P.filled = new Uint8Array(P.N);
-      P.cover = 0; P.locked = false;
-      if (load) {
-        try {
-          const raw = JSON.parse(localStorage.getItem('sssr_pano') || 'null');
-          if (raw && raw.N === P.N) {
-            P.lum.set(raw.lum); P.chr.set(raw.chr); P.filled.set(raw.filled);
-            P.cover = raw.filled.reduce((a, b) => a + b, 0) / P.N;
-          }
-        } catch {}
-      }
-    },
-    panoSave() {
-      const P = this.pano;
-      try {
-        localStorage.setItem('sssr_pano', JSON.stringify({
-          N: P.N, lum: Array.from(P.lum, v => +v.toFixed(1)),
-          chr: Array.from(P.chr, v => +v.toFixed(1)), filled: Array.from(P.filled) }));
-      } catch {}
-    },
-    bin(angle) { const N = this.pano.N; return ((Math.round(angle / 360 * N) % N) + N) % N; },
-
-    panoWrite(lum, chr, pw, fovH) {       // записать текущий вид в панораму
-      const P = this.pano, dpp = fovH / pw;
-      for (let x = 0; x < pw; x++) {
-        const b = this.bin(this.yaw + (x - pw / 2) * dpp);
-        if (P.filled[b]) { P.lum[b] = P.lum[b] * 0.6 + lum[x] * 0.4; P.chr[b] = P.chr[b] * 0.6 + chr[x] * 0.4; }
-        else { P.lum[b] = lum[x]; P.chr[b] = chr[x]; P.filled[b] = 1; P.cover += 1 / P.N; }
-      }
-    },
-
-    panoMatch(lum, chr, pw, fovH) {       // где в панораме мы сейчас
-      const P = this.pano, dpp = fovH / pw, step = 2;
-      let best = null, bestErr = Infinity;
-      for (let c = 0; c < P.N; c += 2) {
-        let err = 0, cnt = 0;
-        for (let x = 0; x < pw; x += step) {
-          const b = (c + Math.round((x - pw / 2) * dpp / 360 * P.N) % P.N + P.N) % P.N;
-          if (!P.filled[b]) continue;
-          err += Math.abs(P.lum[b] - lum[x]) + Math.abs(P.chr[b] - chr[x]) * 1.5;
-          cnt++;
-        }
-        if (cnt < pw / step * 0.5) continue;
-        err /= cnt;
-        if (err < bestErr) { bestErr = err; best = c; }
-      }
-      return best === null ? null : { yaw: best / P.N * 360, err: bestErr };
-    },
-
-    update(d, mask, pw, ph, fovH) {
-      const col = new Float32Array(pw), chr = new Float32Array(pw), row = new Float32Array(ph);
-      const colN = new Float32Array(pw), rowN = new Float32Array(ph);
-      for (let y = 0, i = 0; y < ph; y++)
-        for (let x = 0; x < pw; x++, i++) {
-          if (mask[i]) continue;          // руки не считаем
-          const j = i * 4, r = d[j], g = d[j + 1], b = d[j + 2];
-          const v = r * 0.3 + g * 0.59 + b * 0.11;
-          col[x] += v; colN[x]++;
-          chr[x] += (r - b) * 0.5 + 128;  // цветность: окно холодное, дверь тёплая
-          row[y] += v; rowN[y]++;
-        }
-      for (let x = 0; x < pw; x++) { const n = colN[x] || 1; col[x] /= n; chr[x] /= n; }
-      for (let y = 0; y < ph; y++) row[y] = rowN[y] ? row[y] / rowN[y] : 0;
-
-      // 1) быстрый относительный поворот - по сдвигу кадра
-      if (this.prevCol) {
-        const maxS = Math.max(4, pw >> 4);
-        const sx = this.shift(col, this.prevCol, maxS);
-        const sy = this.shift(row, this.prevRow, maxS);
-        this.quality = sx.err;
-        if (sx.err < 24) {                // резкая смена кадра - сдвигу не верим
-          const degPerPx = fovH / pw;
-          this.yaw += sx.shift * degPerPx;             // картинка уехала влево = голова повернулась вправо
-          this.pitch += sy.shift * degPerPx;
-          this.pitch = Math.max(-70, Math.min(70, this.pitch));
-        }
-      }
-      this.prevCol = col; this.prevRow = row;
-      this.yaw = ((this.yaw % 360) + 360) % 360;
-
-      // 2) привязка к панораме - убирает накопленную ошибку
-      const P = this.pano;
-      if (P.recording) {
-        this.panoWrite(col, chr, pw, fovH);
-      } else if (P.cover > 0.5 && (this.tick = (this.tick | 0) + 1) % 3 === 0) {
-        const m = this.panoMatch(col, chr, pw, fovH);
-        if (m) {
-          P.err = m.err;
-          P.locked = m.err < 18;
-          if (P.locked) {
-            let diff = ((m.yaw - this.yaw + 540) % 360) - 180;   // кратчайший путь по кругу
-            this.yaw += diff * (Math.abs(diff) > 25 ? 0.5 : 0.12);
-            this.yaw = ((this.yaw % 360) + 360) % 360;
-          }
-        }
-      }
-    }
-  };
+  const head = makeHeadTracker('pc');
   head.panoInit(true);
 
   // ---- запись панорамы комнаты ----
@@ -543,6 +579,325 @@ ipdEl.value = store.get('ipd', 63); ipdEl.nextElementSibling.textContent = ipdEl
 ipdEl.oninput = () => { ipdEl.nextElementSibling.textContent = ipdEl.value; store.set('ipd', +ipdEl.value); };
 $('stereo').checked = store.get('stereo', true);
 $('stereo').onchange = () => store.set('stereo', $('stereo').checked);
+// ---- камера телефона как компас по комнате ----
+const phoneHead = makeHeadTracker('phone');
+phoneHead.panoInit(true);
+const phoneCam = { on: false, err: '', fov: 65, zeroYaw: 0, zeroPitch: 0, video: null };
+
+async function startPhoneCam() {
+  if (phoneCam.on) return true;
+  const v = document.createElement('video');
+  v.playsInline = true; v.muted = true;
+  const cv = document.createElement('canvas');
+  const cx = cv.getContext('2d', { willReadFrequently: true });
+  try {
+    v.srcObject = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: 320, height: 240 }, audio: false });
+    await v.play();
+  } catch (e) { phoneCam.err = e.message; return false; }
+
+  phoneCam.on = true; phoneCam.video = v;
+  const pw = 96; let ph = 72, mask = new Uint8Array(pw * ph);
+  setInterval(() => {                      // ~15 кадров в секунду, чтобы не грузить телефон
+    if (v.readyState < 2 || !v.videoWidth) return;
+    const h = Math.round(pw * v.videoHeight / v.videoWidth);
+    if (cv.width !== pw || cv.height !== h) { cv.width = pw; cv.height = h; ph = h; mask = new Uint8Array(pw * h); }
+    cx.drawImage(v, 0, 0, pw, ph);
+    phoneHead.update(cx.getImageData(0, 0, pw, ph).data, mask, pw, ph, phoneCam.fov);
+  }, 66);
+  return true;
+}
+
+let scanTimerPhone = 0;
+$('phoneCam').checked = store.get('phoneCam', true);
+$('phoneCam').onchange = async () => {
+  store.set('phoneCam', $('phoneCam').checked);
+  if ($('phoneCam').checked) await startPhoneCam();
+};
+if ($('phoneCam').checked) startPhoneCam();
+
+$('scanRoomPhone').onclick = async () => {
+  if (!await startPhoneCam()) return;
+  const P = phoneHead.pano;
+  if (P.recording) { stopScanPhone(); return; }
+  phoneHead.panoInit(false); phoneHead.yaw = 0;
+  P.recording = true;
+  $('scanRoomPhone').textContent = '⏹ Стоп';
+  clearTimeout(scanTimerPhone);
+  scanTimerPhone = setTimeout(stopScanPhone, 60000);
+};
+function stopScanPhone() {
+  phoneHead.pano.recording = false;
+  clearTimeout(scanTimerPhone);
+  $('scanRoomPhone').textContent = '🧭 Снять комнату (360°)';
+  phoneHead.panoSave();
+}
+$('clearRoomPhone').onclick = () => {
+  try { localStorage.removeItem('sssr_pano_phone'); } catch {}
+  phoneHead.panoInit(false); stopScanPhone();
+};
+setInterval(() => {
+  const P = phoneHead.pano, el = $('roomInfoPhone');
+  if (!el) return;
+  if (!phoneCam.on) { el.textContent = phoneCam.err ? 'Камера недоступна: ' + phoneCam.err : 'Камера выключена'; return; }
+  if (P.recording) el.textContent = `Съёмка: ${(P.cover * 100) | 0}% круга. Держи телефон как в коробке и медленно повернись.`;
+  else if (P.cover > 0.5) el.textContent = `Компас: ${P.locked ? 'привязан ✓' : 'ищет…'} (снято ${(P.cover * 100) | 0}%), угол ${phoneHead.yaw | 0}°`;
+  else el.textContent = 'Комната не снята. Нажми «Снять комнату» и повернись на 360°.';
+}, 400);
+
+// ======================================================================
+//                            МОЯ КОМНАТА
+// ======================================================================
+// Комната - коробка из 6 фотографий. Их можно снять прямо телефоном,
+// сохранить в браузере и отдать другим одним файлом room.zip.
+const FACES = [
+  { id: 'front',   label: 'Впереди', keys: ['front', 'north'] },
+  { id: 'right',   label: 'Справа',  keys: ['right', 'east'] },
+  { id: 'back',    label: 'Сзади',   keys: ['back', 'south'] },
+  { id: 'left',    label: 'Слева',   keys: ['left', 'west'] },
+  { id: 'floor',   label: 'Пол',     keys: ['floor', 'ground'] },
+  { id: 'ceiling', label: 'Потолок', keys: ['ceil', 'roof'] },
+];
+const roomPics = {};                  // id -> dataURL
+let roomModel = null, onRoomLoaded = null;
+
+const roomDims = {
+  get w() { return +$('rw').value; }, get d() { return +$('rd').value; }, get h() { return +$('rh').value; }
+};
+for (const k of ['rw', 'rd', 'rh']) {
+  const el = $(k); el.value = store.get('dim_' + k, el.value);
+  el.nextElementSibling.textContent = el.value;
+  el.oninput = () => { el.nextElementSibling.textContent = el.value; store.set('dim_' + k, +el.value); rebuildRoom(); };
+}
+
+// ---- слоты с фотографиями ----
+function drawSlots() {
+  const box = $('roomSlots');
+  box.innerHTML = '';
+  for (const f of FACES) {
+    const d = document.createElement('label');
+    d.className = 'slot' + (roomPics[f.id] ? '' : ' empty');
+    d.innerHTML = (roomPics[f.id] ? `<img src="${roomPics[f.id]}">` : '') + `<span>${f.label}</span>`;
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = 'image/*'; inp.capture = 'environment'; inp.hidden = true;
+    inp.onchange = async e => {
+      const file = e.target.files[0];
+      if (file) { roomPics[f.id] = await shrink(file, 768); saveRoom(); drawSlots(); rebuildRoom(); }
+    };
+    d.appendChild(inp);
+    box.appendChild(d);
+  }
+  const n = FACES.filter(f => roomPics[f.id]).length;
+  $('objInfo').textContent = n ? `Готово граней: ${n} из 6` : 'Комната не задана — будет простая сцена.';
+}
+
+// фото ужимаем в квадрат, иначе 6 снимков не влезут в память браузера
+function shrink(fileOrBlob, size) {
+  return new Promise(res => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas');
+      c.width = c.height = size;
+      const g = c.getContext('2d');
+      const s = Math.min(img.width, img.height);
+      g.drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, size, size);
+      res(c.toDataURL('image/jpeg', 0.82));
+      URL.revokeObjectURL(img.src);
+    };
+    img.src = URL.createObjectURL(fileOrBlob);
+  });
+}
+
+function saveRoom() { try { localStorage.setItem('sssr_room', JSON.stringify(roomPics)); } catch {} }
+function loadRoom() {
+  try { Object.assign(roomPics, JSON.parse(localStorage.getItem('sssr_room') || '{}')); } catch {}
+}
+$('clearRoomModel').onclick = () => {
+  for (const f of FACES) delete roomPics[f.id];
+  try { localStorage.removeItem('sssr_room'); } catch {}
+  saveRoom(); drawSlots(); rebuildRoom();
+};
+
+// ---- сборка коробки ----
+function buildRoom() {
+  if (!FACES.some(f => roomPics[f.id])) return null;
+  const W = roomDims.w, D = roomDims.d, H = roomDims.h;
+  const g = new THREE.Group();
+  const geo = { front: [W, H], back: [W, H], right: [D, H], left: [D, H], floor: [W, D], ceiling: [W, D] };
+  const put = {
+    front:   m => { m.position.set(0, H / 2, -D / 2); },
+    back:    m => { m.position.set(0, H / 2, D / 2); m.rotation.y = Math.PI; },
+    right:   m => { m.position.set(W / 2, H / 2, 0); m.rotation.y = -Math.PI / 2; },
+    left:    m => { m.position.set(-W / 2, H / 2, 0); m.rotation.y = Math.PI / 2; },
+    floor:   m => { m.position.set(0, 0, 0); m.rotation.x = -Math.PI / 2; },
+    ceiling: m => { m.position.set(0, H, 0); m.rotation.x = Math.PI / 2; },
+  };
+  for (const f of FACES) {
+    const [a, b] = geo[f.id];
+    const mat = roomPics[f.id]
+      ? new THREE.MeshBasicMaterial({ map: new THREE.TextureLoader().load(roomPics[f.id]) })
+      : new THREE.MeshBasicMaterial({ color: 0x3a4653 });
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(a, b), mat);
+    put[f.id](m);
+    g.add(m);
+  }
+  return g;
+}
+function rebuildRoom() {
+  const m = buildRoom();
+  roomModel = m;
+  if (onRoomLoaded) onRoomLoaded(m);
+}
+
+// ---- room.zip: читаем ----
+async function readZip(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const dv = new DataView(buf.buffer);
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0 && i > buf.length - 66000; i--)
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error('это не zip');
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const method = dv.getUint16(p + 10, true);
+    const csize = dv.getUint32(p + 20, true);
+    const nameLen = dv.getUint16(p + 28, true);
+    const extraLen = dv.getUint16(p + 30, true);
+    const cmtLen = dv.getUint16(p + 32, true);
+    const lho = dv.getUint32(p + 42, true);
+    const name = new TextDecoder().decode(buf.subarray(p + 46, p + 46 + nameLen));
+    const lNameLen = dv.getUint16(lho + 26, true), lExtraLen = dv.getUint16(lho + 28, true);
+    const start = lho + 30 + lNameLen + lExtraLen;
+    let data = buf.subarray(start, start + csize);
+    if (method === 8) {
+      const ds = new DecompressionStream('deflate-raw');
+      data = new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(ds)).arrayBuffer());
+    } else if (method !== 0) continue;
+    out.push({ name, data });
+    p += 46 + nameLen + extraLen + cmtLen;
+  }
+  return out;
+}
+
+$('roomZip').onchange = async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  $('objInfo').textContent = 'Читаю архив…';
+  try {
+    const files = await readZip(file);
+    const obj = files.find(f => /\.obj$/i.test(f.name));
+    if (obj) {                           // размеры берём из модели
+      const txt = new TextDecoder().decode(obj.data);
+      const xs = [], ys = [], zs = [];
+      for (const line of txt.split('\n'))
+        if (line.startsWith('v ')) { const q = line.split(/\s+/); xs.push(+q[1]); ys.push(+q[2]); zs.push(+q[3]); }
+      if (xs.length) {
+        const r = (a) => +(Math.max(...a) - Math.min(...a)).toFixed(2);
+        $('rw').value = r(xs); $('rh').value = r(ys); $('rd').value = r(zs);
+        for (const k of ['rw', 'rd', 'rh']) { $(k).nextElementSibling.textContent = $(k).value; store.set('dim_' + k, +$(k).value); }
+      }
+    }
+    let n = 0;
+    for (const f of FACES) {
+      const img = files.find(x => /\.(jpg|jpeg|png|webp)$/i.test(x.name) &&
+                                  f.keys.some(k => x.name.toLowerCase().includes(k)));
+      if (!img) continue;
+      roomPics[f.id] = await shrink(new Blob([img.data]), 768);
+      n++;
+    }
+    saveRoom(); drawSlots(); rebuildRoom();
+    $('objInfo').textContent = n ? `Из архива взято граней: ${n}` : 'В архиве не нашлись картинки с именами front/right/back/left/floor/ceiling';
+  } catch (err) { $('objInfo').textContent = 'Не удалось прочитать: ' + err.message; }
+};
+
+// ---- room.zip: пишем (без сжатия, зато без библиотек) ----
+const CRC = (() => { const t = new Uint32Array(256); for (let i = 0; i < 256; i++) { let c = i; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[i] = c >>> 0; } return t; })();
+function crc32(u8) { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = CRC[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+
+function makeZip(entries) {
+  const enc = new TextEncoder(), parts = [], central = [];
+  let offset = 0;
+  for (const { name, data } of entries) {
+    const nb = enc.encode(name), crc = crc32(data);
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true);
+    lh.setUint32(14, crc, true); lh.setUint32(18, data.length, true);
+    lh.setUint32(22, data.length, true); lh.setUint16(26, nb.length, true);
+    parts.push(new Uint8Array(lh.buffer), nb, data);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true);
+    ch.setUint32(16, crc, true); ch.setUint32(20, data.length, true);
+    ch.setUint32(24, data.length, true); ch.setUint16(28, nb.length, true);
+    ch.setUint32(42, offset, true);
+    central.push(new Uint8Array(ch.buffer), nb);
+    offset += 30 + nb.length + data.length;
+  }
+  const cSize = central.reduce((a, b) => a + b.length, 0);
+  const eo = new DataView(new ArrayBuffer(22));
+  eo.setUint32(0, 0x06054b50, true);
+  eo.setUint16(8, entries.length, true); eo.setUint16(10, entries.length, true);
+  eo.setUint32(12, cSize, true); eo.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, new Uint8Array(eo.buffer)], { type: 'application/zip' });
+}
+
+$('dlRoom').onclick = async () => {
+  const have = FACES.filter(f => roomPics[f.id]);
+  if (!have.length) { $('objInfo').textContent = 'Сначала добавь хотя бы одно фото'; return; }
+  const enc = new TextEncoder();
+  const entries = [];
+  for (const f of have) {
+    const b = await (await fetch(roomPics[f.id])).arrayBuffer();
+    entries.push({ name: f.id + '.jpg', data: new Uint8Array(b) });
+  }
+  // OBJ рядом - чтобы комнату можно было открыть и в любом 3D-редакторе
+  const W = roomDims.w, H = roomDims.h, D = roomDims.d, hw = W / 2, hd = D / 2;
+  const quads = {
+    front:   [[-hw, 0, -hd], [hw, 0, -hd], [hw, H, -hd], [-hw, H, -hd]],
+    back:    [[hw, 0, hd], [-hw, 0, hd], [-hw, H, hd], [hw, H, hd]],
+    right:   [[hw, 0, -hd], [hw, 0, hd], [hw, H, hd], [hw, H, -hd]],
+    left:    [[-hw, 0, hd], [-hw, 0, -hd], [-hw, H, -hd], [-hw, H, hd]],
+    floor:   [[-hw, 0, hd], [hw, 0, hd], [hw, 0, -hd], [-hw, 0, -hd]],
+    ceiling: [[-hw, H, -hd], [hw, H, -hd], [hw, H, hd], [-hw, H, hd]],
+  };
+  const uv = [[0, 0], [1, 0], [1, 1], [0, 1]];
+  let obj = `# Комната ${W} x ${D} м, высота ${H} м\nmtllib room.mtl\no Room\n`, mtl = '';
+  let vi = 1;
+  for (const f of have) {
+    for (const v of quads[f.id]) obj += `v ${v.join(' ')}\n`;
+    for (const t of uv) obj += `vt ${t.join(' ')}\n`;
+    obj += `usemtl ${f.id}\nf ` + [0, 1, 2, 3].map(k => `${vi + k}/${vi + k}`).join(' ') + '\n';
+    mtl += `newmtl ${f.id}\nKd 1 1 1\nmap_Kd ${f.id}.jpg\n\n`;
+    vi += 4;
+  }
+  entries.push({ name: 'room.obj', data: enc.encode(obj) }, { name: 'room.mtl', data: enc.encode(mtl) });
+
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(makeZip(entries));
+  a.download = 'room.zip';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+};
+
+loadRoom(); drawSlots(); rebuildRoom();
+
+// если модель лежит рядом с сайтом - подхватим её (room.zip в папке сайта)
+(async () => {
+  if (FACES.some(f => roomPics[f.id])) return;
+  try {
+    const r = await fetch('room.zip');
+    if (!r.ok) return;
+    const files = await readZip(new Blob([await r.arrayBuffer()]));
+    let n = 0;
+    for (const f of FACES) {
+      const img = files.find(x => /\.(jpg|jpeg|png|webp)$/i.test(x.name) && f.keys.some(k => x.name.toLowerCase().includes(k)));
+      if (img) { roomPics[f.id] = await shrink(new Blob([img.data]), 768); n++; }
+    }
+    if (n) { drawSlots(); rebuildRoom(); $('objInfo').textContent = `Комната с сайта: ${n} граней`; }
+  } catch {}
+})();
+
 let useWebcamHead = store.get('webHead', true);
 $('webHead').checked = useWebcamHead;
 $('webHead').onchange = () => { useWebcamHead = $('webHead').checked; store.set('webHead', useWebcamHead); };
@@ -594,6 +949,21 @@ function startVr() {
     m.position.set(Math.sin(a) * r, m.geometry.parameters.height / 2, -Math.cos(a) * r);
     scene.add(m);
   }
+
+  // модель комнаты вместо простой сцены
+  const demo = new THREE.Group();
+  scene.children.filter(o => o !== camera && !o.isLight).forEach(o => { scene.remove(o); demo.add(o); });
+  scene.add(demo);
+  let roomInScene = null;
+  function useRoom(model) {
+    if (roomInScene) { scene.remove(roomInScene); roomInScene = null; }
+    demo.visible = !model;
+    if (!model) return;
+    scene.add(model);
+    roomInScene = model;
+  }
+  useRoom(roomModel);
+  onRoomLoaded = useRoom;      // комнату можно поменять, не выходя из VR
 
   // руки - дети камеры: вебка на голове, позиции рук уже относительно головы
   const handMat = c => new THREE.MeshLambertMaterial({ color: c, emissive: c, emissiveIntensity: 0.25 });
@@ -708,6 +1078,7 @@ function startVr() {
   // Поэтому неважно, как телефон лежит в коробке и как браузер трактует оси.
   function recenter() {
     camHead.zeroYaw = camHead.yaw; camHead.zeroPitch = camHead.pitch;
+    phoneCam.zeroYaw = phoneHead.yaw; phoneCam.zeroPitch = phoneHead.pitch;
     dragYaw = 0; dragPitch = 0;
     const q = headQuat(qDev);
     if (!q) { qZero.identity(); return; }
@@ -726,7 +1097,7 @@ function startVr() {
     const web = useWebcamHead && performance.now() - camHead.alive < 500;
     const t = ori ? `gyro ${gyroKind === 'absolute' ? 'A' : 'R'} ${ori.alpha | 0}/${ori.beta | 0}/${ori.gamma | 0}`
             : motion.hasRate ? 'motion ✓'
-            : motion.ready ? `наклон + ${web ? 'вебка ' + (camHead.yaw | 0) + '°' : 'палец'}`
+            : motion.ready ? `наклон + ${phoneCam.on && phoneHead.pano.cover > 0.5 ? 'камера ' + (phoneHead.yaw | 0) + '°' : web ? 'вебка ' + (camHead.yaw | 0) + '°' : 'палец'}`
             : web ? `вебка ${camHead.yaw | 0}° / ${camHead.pitch | 0}°`
             : 'нет датчиков (палец)';
     gi.textContent = t;
@@ -839,19 +1210,22 @@ function startVr() {
     const dt = Math.min((now - lastFrame) / 1000, 0.1); lastFrame = now;
     if (!ori && motion.ready) motion.update(dt);
 
-    // поворот с вебки нужен, только когда своего гироскопа нет
+    // откуда брать поворот вбок: гироскоп -> камера телефона -> вебка ПК -> палец
     const webLive = useWebcamHead && performance.now() - camHead.alive < 500;
-    const webYaw = webLive ? -(camHead.yaw - camHead.zeroYaw) * deg : 0;
+    const phoneLive = $('phoneCam').checked && phoneCam.on && phoneHead.pano.cover > 0.5;
+    const sideYaw = phoneLive ? -(phoneHead.yaw - phoneCam.zeroYaw) * deg
+                  : webLive ? -(camHead.yaw - camHead.zeroYaw) * deg
+                  : dragYaw;
 
     const q = headQuat(qDev);
     if (q) {
       // наклон берём с датчика телефона, поворот вбок - с вебки или пальцем
-      const extra = (ori || motion.hasRate) ? 0 : (webLive ? webYaw : dragYaw);
+      const extra = (ori || motion.hasRate) ? 0 : sideYaw;
       qYaw.setFromAxisAngle(Y, extra);
       camera.quaternion.copy(qYaw).multiply(qZero).multiply(q);
-    } else if (webLive) {
-      camera.quaternion.setFromEuler(new THREE.Euler(
-        -(camHead.pitch - camHead.zeroPitch) * deg + dragPitch, webYaw, 0, 'YXZ'));
+    } else if (phoneLive || webLive) {
+      const p = phoneLive ? -(phoneHead.pitch - phoneCam.zeroPitch) : -(camHead.pitch - camHead.zeroPitch);
+      camera.quaternion.setFromEuler(new THREE.Euler(p * deg + dragPitch, sideYaw, 0, 'YXZ'));
     } else {
       camera.quaternion.setFromEuler(new THREE.Euler(dragPitch, dragYaw, 0, 'YXZ'));
     }
