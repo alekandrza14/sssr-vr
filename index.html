@@ -102,16 +102,14 @@
   <div class="card">
     <div class="row">
       <label><input type="checkbox" id="stereo" checked> Два глаза (для коробки)</label>
-      <label><input type="checkbox" id="webHead" checked> Поворот головы с вебки (если нет гироскопа)</label>
+
     </div>
     <label class="s">Расстояние глаз, мм <input type="range" id="ipd" min="50" max="75" step="1" value="63"><span></span></label>
   </div>
   <div class="card">
     <div class="row"><label><input type="checkbox" id="phoneCam" checked> Поворот по камере телефона (компас по комнате)</label></div>
-    <div class="row">
-      <button id="scanRoomPhone">🧭 Снять комнату (360°)</button>
-      <button id="clearRoomPhone">Сброс</button>
-    </div>
+    <label class="s">Угол обзора камеры <input type="range" id="camFov" min="40" max="110" step="1" value="68"><span></span></label>
+    <div class="row"><button id="autoFov">Подобрать угол по комнате</button></div>
     <div class="muted" id="roomInfoPhone">Камера выключена</div>
   </div>
   <div class="card">
@@ -551,8 +549,6 @@ function rgb2hsv(r, g, b) {
 //                              ТЕЛЕФОН: VR
 // ======================================================================
 let conn = null, hands = { l: [0, 0, 0, 0, 0.4], r: [0, 0, 0, 0, 0.4] };
-// поворот головы, посчитанный вебкой на лбу (запасной вариант, если в телефоне нет гироскопа)
-const camHead = { yaw: 0, pitch: 0, alive: 0, zeroYaw: 0, zeroPitch: 0 };
 
 $('codeIn').value = store.get('code', '');
 $('connect').onclick = () => {
@@ -567,7 +563,6 @@ $('connect').onclick = () => {
     conn.on('data', d => {
       if (!d || !d.l || !d.r) return;
       hands = d;
-      if (d.h) { camHead.yaw = d.h[0]; camHead.pitch = d.h[1]; camHead.alive = performance.now(); }
     });
     conn.on('close', () => vrStatus('ПК отключился', 'bad'));
   });
@@ -580,10 +575,170 @@ ipdEl.value = store.get('ipd', 63); ipdEl.nextElementSibling.textContent = ipdEl
 ipdEl.oninput = () => { ipdEl.nextElementSibling.textContent = ipdEl.value; store.set('ipd', +ipdEl.value); };
 $('stereo').checked = store.get('stereo', true);
 $('stereo').onchange = () => store.set('stereo', $('stereo').checked);
-// ---- камера телефона как компас по комнате ----
-const phoneHead = makeHeadTracker('phone');
-phoneHead.panoInit(true);
-const phoneCam = { on: false, err: '', fov: 65, zeroYaw: 0, zeroPitch: 0, video: null };
+// ======================================================================
+//        КОМПАС ПО КОМНАТЕ: кадр камеры сравнивается с кубической картой
+// ======================================================================
+// Из 6 фотографий строим панораму комнаты (эквирект: по горизонтали азимут,
+// по вертикали подъём). Кадр с камеры переводим в такую же угловую сетку
+// и ищем, при каком повороте они совпадают. Это и есть направление взгляда.
+const cube = {
+  W: 360, H: 180,              // 1 бин = 1 градус
+  lum: null, chr: null, has: null, ready: false,
+  faces: {},                   // грань -> {lum, chr, n}
+  GW: 32, GH: 24,              // сетка кадра камеры
+  axBin: null, ayBin: null,    // углы ячеек сетки, в бинах
+  fLum: null, fChr: null,      // текущий кадр в этой сетке
+  yaw: 0, pitch: 0, err: 999, locked: false, searched: 0, maxErr: 55, needGrid: false, aspect: 4 / 3,
+
+  async build(pics, W, Hh, D) {
+    const N = 128;
+    this.faces = {};
+    for (const f of FACES) {
+      if (!pics[f.id]) continue;
+      const img = await new Promise(res => { const i = new Image(); i.onload = () => res(i); i.src = pics[f.id]; });
+      const c = document.createElement('canvas'); c.width = c.height = N;
+      const g = c.getContext('2d', { willReadFrequently: true });
+      g.drawImage(img, 0, 0, N, N);
+      const d = g.getImageData(0, 0, N, N).data;
+      const lum = new Float32Array(N * N), chr = new Float32Array(N * N);
+      for (let i = 0, j = 0; i < N * N; i++, j += 4) {
+        lum[i] = d[j] * 0.3 + d[j + 1] * 0.59 + d[j + 2] * 0.11;
+        chr[i] = (d[j] - d[j + 2]) * 0.5 + 128;
+      }
+      this.faces[f.id] = { lum, chr, n: N };
+    }
+    if (!Object.keys(this.faces).length) { this.ready = false; return; }
+
+    // луч из центра комнаты во все стороны -> какая грань и какая её точка
+    const eye = [0, 1.6, 0], hw = W / 2, hd = D / 2;
+    this.lum = new Float32Array(this.W * this.H);
+    this.chr = new Float32Array(this.W * this.H);
+    this.has = new Uint8Array(this.W * this.H);
+    for (let ei = 0; ei < this.H; ei++) {
+      const el = (ei - this.H / 2 + 0.5) * Math.PI / 180;
+      for (let ai = 0; ai < this.W; ai++) {
+        const az = ai * Math.PI / 180;
+        // три.js: при yaw=0 камера смотрит в -Z, поэтому вперёд = -Z
+        const d = [Math.sin(az) * Math.cos(el), Math.sin(el), -Math.cos(az) * Math.cos(el)];
+        let t = Infinity, face = null;
+        const hit = (tt, id) => { if (tt > 1e-4 && tt < t) { t = tt; face = id; } };
+        if (d[0] > 0) hit((hw - eye[0]) / d[0], '+x'); else if (d[0] < 0) hit((-hw - eye[0]) / d[0], '-x');
+        if (d[1] > 0) hit((Hh - eye[1]) / d[1], '+y'); else if (d[1] < 0) hit((0 - eye[1]) / d[1], '-y');
+        if (d[2] < 0) hit((-hd - eye[2]) / d[2], '+z'); else if (d[2] > 0) hit((hd - eye[2]) / d[2], '-z');
+        if (!face || !this.faces[face]) continue;
+
+        const p = [eye[0] + d[0] * t, eye[1] + d[1] * t, eye[2] + d[2] * t];
+        let u, v;
+        if (face === '+z') { u = (p[0] + hw) / W; v = p[1] / Hh; }
+        else if (face === '-z') { u = (hw - p[0]) / W; v = p[1] / Hh; }
+        else if (face === '+x') { u = (p[2] + hd) / D; v = p[1] / Hh; }
+        else if (face === '-x') { u = (hd - p[2]) / D; v = p[1] / Hh; }
+        else if (face === '-y') { u = (p[0] + hw) / W; v = (hd - p[2]) / D; }
+        else { u = (p[0] + hw) / W; v = (p[2] + hd) / D; }
+
+        const F = this.faces[face], n = F.n;
+        const px = Math.min(n - 1, Math.max(0, (u * n) | 0));
+        const py = Math.min(n - 1, Math.max(0, ((1 - v) * n) | 0));
+        const k = py * n + px, idx = ei * this.W + ai;
+        this.lum[idx] = F.lum[k]; this.chr[idx] = F.chr[k]; this.has[idx] = 1;
+      }
+    }
+    this.ready = true; this.searched = 0; this.locked = false;
+  },
+
+  // углы ячеек сетки кадра (считаются один раз на размер кадра)
+  makeGrid(fovH, aspect) {
+    const tH = Math.tan(fovH * Math.PI / 360), tV = tH / aspect;
+    this.axBin = new Int16Array(this.GW); this.ayBin = new Int16Array(this.GH);
+    for (let i = 0; i < this.GW; i++) {
+      const dx = (i + 0.5) / this.GW * 2 - 1;
+      this.axBin[i] = Math.round(Math.atan(dx * tH) * 180 / Math.PI);
+    }
+    for (let j = 0; j < this.GH; j++) {
+      const dy = 1 - (j + 0.5) / this.GH * 2;
+      this.ayBin[j] = Math.round(Math.atan(dy * tV) * 180 / Math.PI);
+    }
+  },
+
+  // кадр камеры -> та же угловая сетка
+  frame(data, pw, ph) {
+    if (!this.fLum) { this.fLum = new Float32Array(this.GW * this.GH); this.fChr = new Float32Array(this.GW * this.GH); }
+    for (let j = 0; j < this.GH; j++) {
+      const py = Math.min(ph - 1, ((j + 0.5) / this.GH * ph) | 0);
+      for (let i = 0; i < this.GW; i++) {
+        const px = Math.min(pw - 1, ((i + 0.5) / this.GW * pw) | 0);
+        const k = (py * pw + px) * 4, o = j * this.GW + i;
+        this.fLum[o] = data[k] * 0.3 + data[k + 1] * 0.59 + data[k + 2] * 0.11;
+        this.fChr[o] = (data[k] - data[k + 2]) * 0.5 + 128;
+      }
+    }
+  },
+
+  // Насколько кадр похож на панораму при данном повороте.
+  // Общую разницу в яркости вычитаем: в комнате мог поменяться свет.
+  score(yawBin, pitchBin) {
+    const GW = this.GW, GH = this.GH, W = this.W, H2 = this.H >> 1;
+    let dl = 0, dc = 0, cnt = 0;
+    for (let j = 0; j < GH; j++) {
+      const ei = pitchBin + this.ayBin[j] + H2;
+      if (ei < 0 || ei >= this.H) continue;
+      const row = ei * W;
+      for (let i = 0; i < GW; i++) {
+        let ai = (yawBin + this.axBin[i]) % W; if (ai < 0) ai += W;
+        const idx = row + ai;
+        if (!this.has[idx]) continue;
+        const o = j * GW + i;
+        dl += this.lum[idx] - this.fLum[o];
+        dc += this.chr[idx] - this.fChr[o];
+        cnt++;
+      }
+    }
+    if (cnt < GW * GH * 0.3) return Infinity;
+    const ml = dl / cnt, mc = dc / cnt;
+    let err = 0;
+    for (let j = 0; j < GH; j++) {
+      const ei = pitchBin + this.ayBin[j] + H2;
+      if (ei < 0 || ei >= this.H) continue;
+      const row = ei * W;
+      for (let i = 0; i < GW; i++) {
+        let ai = (yawBin + this.axBin[i]) % W; if (ai < 0) ai += W;
+        const idx = row + ai;
+        if (!this.has[idx]) continue;
+        const o = j * GW + i;
+        err += Math.abs(this.lum[idx] - this.fLum[o] - ml) + Math.abs(this.chr[idx] - this.fChr[o] - mc) * 1.2;
+      }
+    }
+    return err / cnt;
+  },
+
+  // ищем поворот: сначала грубо по кругу, дальше только рядом с прошлым
+  locate(full) {
+    if (!this.ready || !this.axBin) return;
+    let best = null, bestErr = Infinity;
+    const test = (y, p) => { const e = this.score(y, p); if (e < bestErr) { bestErr = e; best = [y, p]; } };
+
+    if (full || !this.locked) {
+      for (let y = 0; y < this.W; y += 4) for (let p = -30; p <= 30; p += 6) test(y, p);
+      if (best) { for (let y = best[0] - 4; y <= best[0] + 4; y++) for (let p = best[1] - 6; p <= best[1] + 6; p += 2) test(y, p); }
+    } else {
+      const y0 = Math.round(this.yaw), p0 = Math.round(this.pitch);
+      for (let y = y0 - 14; y <= y0 + 14; y += 2) for (let p = p0 - 10; p <= p0 + 10; p += 2) test(y, p);
+      for (let y = best[0] - 2; y <= best[0] + 2; y++) for (let p = best[1] - 2; p <= best[1] + 2; p++) test(y, p);
+    }
+    if (!best) return;
+    this.err = bestErr;
+    const wasLocked = this.locked;
+    this.locked = bestErr < this.maxErr;
+    // после полного поиска прыгаем сразу, дальше сглаживаем
+    const k = (!wasLocked || full) ? 1 : 0.5;
+    let d = ((best[0] - this.yaw + 540) % 360) - 180;
+    this.yaw = ((this.yaw + d * k) % 360 + 360) % 360;
+    this.pitch += (best[1] - this.pitch) * k;
+  }
+};
+
+// ---- камера телефона ----
+const phoneCam = { on: false, err: '', fov: 65, video: null, fps: 0 };
 
 async function startPhoneCam() {
   if (phoneCam.on) return true;
@@ -598,18 +753,53 @@ async function startPhoneCam() {
   } catch (e) { phoneCam.err = e.message; return false; }
 
   phoneCam.on = true; phoneCam.video = v;
-  const pw = 96; let ph = 72, mask = new Uint8Array(pw * ph);
-  setInterval(() => {                      // ~15 кадров в секунду, чтобы не грузить телефон
-    if (v.readyState < 2 || !v.videoWidth) return;
+  const pw = 96;
+  let ph = 72, tick = 0, t0 = performance.now();
+  setInterval(() => {
+    if (v.readyState < 2 || !v.videoWidth || !cube.ready) return;
     const h = Math.round(pw * v.videoHeight / v.videoWidth);
-    if (cv.width !== pw || cv.height !== h) { cv.width = pw; cv.height = h; ph = h; mask = new Uint8Array(pw * h); }
+    if (cv.width !== pw || cv.height !== h || cube.needGrid) {
+      cv.width = pw; cv.height = h; ph = h;
+      cube.aspect = pw / ph;
+      cube.makeGrid(phoneCam.fov, cube.aspect);
+      cube.needGrid = false;
+    }
     cx.drawImage(v, 0, 0, pw, ph);
-    phoneHead.update(cx.getImageData(0, 0, pw, ph).data, mask, pw, ph, phoneCam.fov);
+    cube.frame(cx.getImageData(0, 0, pw, ph).data, pw, ph);
+    cube.locate((tick % 30) === 0);        // раз в 2 секунды - полный круг, иначе рядом
+    tick++;
+    if (tick % 15 === 0) { phoneCam.fps = Math.round(15000 / (performance.now() - t0)); t0 = performance.now(); }
   }, 66);
   return true;
 }
 
-let scanTimerPhone = 0;
+const fovEl = $('camFov');
+phoneCam.fov = store.get('camFov', 68);
+fovEl.value = phoneCam.fov; fovEl.nextElementSibling.textContent = phoneCam.fov + '°';
+fovEl.oninput = () => {
+  phoneCam.fov = +fovEl.value;
+  fovEl.nextElementSibling.textContent = phoneCam.fov + '°';
+  store.set('camFov', phoneCam.fov);
+  cube.needGrid = true;
+};
+
+// подбираем угол обзора: при каком значении кадр лучше всего ложится на комнату
+$('autoFov').onclick = () => {
+  if (!cube.ready || !cube.fLum) { $('roomInfoPhone').textContent = 'Сначала камера и фото комнаты'; return; }
+  let best = phoneCam.fov, bestErr = Infinity;
+  for (let f = 45; f <= 100; f += 2) {
+    cube.makeGrid(f, cube.aspect || 4 / 3);
+    cube.locked = false;
+    cube.locate(true);
+    if (cube.err < bestErr) { bestErr = cube.err; best = f; }
+  }
+  phoneCam.fov = best;
+  fovEl.value = best; fovEl.nextElementSibling.textContent = best + '°';
+  store.set('camFov', best);
+  cube.needGrid = true;
+  $('roomInfoPhone').textContent = `Подобран угол ${best}° (расхождение ${bestErr.toFixed(1)})`;
+};
+
 $('phoneCam').checked = store.get('phoneCam', true);
 $('phoneCam').onchange = async () => {
   store.set('phoneCam', $('phoneCam').checked);
@@ -617,42 +807,21 @@ $('phoneCam').onchange = async () => {
 };
 if ($('phoneCam').checked) startPhoneCam();
 
-$('scanRoomPhone').onclick = async () => {
-  if (!await startPhoneCam()) return;
-  const P = phoneHead.pano;
-  if (P.recording) { stopScanPhone(); return; }
-  phoneHead.panoInit(false); phoneHead.yaw = 0;
-  P.recording = true;
-  $('scanRoomPhone').textContent = '⏹ Стоп';
-  clearTimeout(scanTimerPhone);
-  scanTimerPhone = setTimeout(stopScanPhone, 60000);
-};
-function stopScanPhone() {
-  phoneHead.pano.recording = false;
-  clearTimeout(scanTimerPhone);
-  $('scanRoomPhone').textContent = '🧭 Снять комнату (360°)';
-  phoneHead.panoSave();
-}
-$('clearRoomPhone').onclick = () => {
-  try { localStorage.removeItem('sssr_pano_phone'); } catch {}
-  phoneHead.panoInit(false); stopScanPhone();
-};
 setInterval(() => {
-  const P = phoneHead.pano, el = $('roomInfoPhone');
+  const el = $('roomInfoPhone');
   if (!el) return;
   if (!phoneCam.on) { el.textContent = phoneCam.err ? 'Камера недоступна: ' + phoneCam.err : 'Камера выключена'; return; }
-  if (P.recording) el.textContent = `Съёмка: ${(P.cover * 100) | 0}% круга. Держи телефон как в коробке и медленно повернись.`;
-  else if (P.cover > 0.5) el.textContent = `Компас: ${P.locked ? 'привязан ✓' : 'ищет…'} (снято ${(P.cover * 100) | 0}%), угол ${phoneHead.yaw | 0}°`;
-  else el.textContent = 'Комната не снята. Нажми «Снять комнату» и повернись на 360°.';
-}, 400);
+  if (!cube.ready) { el.textContent = 'Нужны фотографии комнаты — добавь их ниже.'; return; }
+  el.textContent = cube.locked
+    ? `Вижу комнату ✓  угол ${cube.yaw | 0}°, наклон ${cube.pitch | 0}°  (расхождение ${cube.err.toFixed(0)})`
+    : `Ищу совпадение с комнатой… (расхождение ${cube.err === 999 ? '—' : cube.err.toFixed(0)})`;
+}, 300);
 
 // ======================================================================
 //                            МОЯ КОМНАТА
 // ======================================================================
-// Комната - коробка из 6 фотографий. Их можно снять прямо телефоном,
-// сохранить в браузере и отдать другим одним файлом room.zip.
-// Стандарт имён файлов: +z вперёд, -z назад, +x вправо, -x влево, +y вверх, -y вниз.
-// Расширение любое. Старые имена (front/north/...) тоже понимаем.
+// Комната - коробка из 6 фотографий. Имена граней: +z вперёд, -z назад,
+// +x вправо, -x влево, +y вверх, -y вниз. Расширение любое.
 const FACES = [
   { id: '+z', label: 'Впереди +z', keys: ['+z', 'front', 'north'] },
   { id: '+x', label: 'Справа +x',  keys: ['+x', 'right', 'east'] },
@@ -661,7 +830,7 @@ const FACES = [
   { id: '-y', label: 'Пол -y',     keys: ['-y', 'floor', 'ground', 'bottom'] },
   { id: '+y', label: 'Потолок +y', keys: ['+y', 'ceil', 'roof', 'top'] },
 ];
-const roomPics = {};                  // id -> dataURL
+const roomPics = {};
 let roomModel = null, onRoomLoaded = null;
 
 let roomYaw = store.get('roomYaw', 0);    // разворот модели под реальную комнату
@@ -686,7 +855,6 @@ for (const k of ['rw', 'rd', 'rh']) {
   el.oninput = () => { el.nextElementSibling.textContent = el.value; store.set('dim_' + k, +el.value); rebuildRoom(); };
 }
 
-// ---- слоты с фотографиями ----
 function drawSlots() {
   const box = $('roomSlots');
   box.innerHTML = '';
@@ -707,7 +875,7 @@ function drawSlots() {
   $('objInfo').textContent = n ? `Готово граней: ${n} из 6` : 'Комната не задана — будет простая сцена.';
 }
 
-// фото ужимаем в квадрат, иначе 6 снимков не влезут в память браузера
+// фото ужимаем, иначе шесть снимков переполнят память браузера
 function shrink(fileOrBlob, size) {
   return new Promise(res => {
     const img = new Image();
@@ -725,9 +893,7 @@ function shrink(fileOrBlob, size) {
 }
 
 function saveRoom() { try { localStorage.setItem('sssr_room', JSON.stringify(roomPics)); } catch {} }
-function loadRoom() {
-  try { Object.assign(roomPics, JSON.parse(localStorage.getItem('sssr_room') || '{}')); } catch {}
-}
+function loadRoom() { try { Object.assign(roomPics, JSON.parse(localStorage.getItem('sssr_room') || '{}')); } catch {} }
 $('clearRoomModel').onclick = () => {
   for (const f of FACES) delete roomPics[f.id];
   try { localStorage.removeItem('sssr_room'); } catch {}
@@ -739,7 +905,7 @@ function buildRoom() {
   if (!FACES.some(f => roomPics[f.id])) return null;
   const W = roomDims.w, D = roomDims.d, H = roomDims.h;
   const g = new THREE.Group();
-  // "вперёд" у пользователя = +z, а камера three.js смотрит в -Z, поэтому передняя грань там
+  // "вперёд" у пользователя = +z, а камера three.js смотрит в -Z, там и стоит передняя грань
   const geo = { '+z': [W, H], '-z': [W, H], '+x': [D, H], '-x': [D, H], '-y': [W, D], '+y': [W, D] };
   const put = {
     '+z': m => { m.position.set(0, H / 2, -D / 2); },
@@ -760,25 +926,24 @@ function buildRoom() {
   }
   return g;
 }
+
+let cubeBuildTimer = 0;
 function rebuildRoom() {
   const m = buildRoom();
   roomModel = m;
   if (m) m.rotation.y = roomYaw * Math.PI / 180;
   if (onRoomLoaded) onRoomLoaded(m);
+  // панорама для компаса: с задержкой, чтобы не пересобирать на каждый шаг ползунка
+  clearTimeout(cubeBuildTimer);
+  cubeBuildTimer = setTimeout(() => cube.build(roomPics, roomDims.w, roomDims.h, roomDims.d), 300);
 }
 
 // какая картинка из архива относится к этой грани
 function pickFace(files, f) {
   const pics = files.filter(x => /\.(jpe?g|png|webp|bmp|gif)$/i.test(x.name));
   const base = x => x.name.toLowerCase().replace(/^.*[\\/]/, '').replace(/\.[^.]+$/, '');
-  for (const k of f.keys) {                 // сначала точное имя файла (+z.jpg)
-    const hit = pics.find(x => base(x) === k);
-    if (hit) return hit;
-  }
-  for (const k of f.keys.slice(1)) {        // потом по вхождению (north_window.jpg)
-    const hit = pics.find(x => base(x).includes(k));
-    if (hit) return hit;
-  }
+  for (const k of f.keys) { const hit = pics.find(x => base(x) === k); if (hit) return hit; }
+  for (const k of f.keys.slice(1)) { const hit = pics.find(x => base(x).includes(k)); if (hit) return hit; }
   return null;
 }
 
@@ -814,44 +979,49 @@ async function readZip(file) {
   return out;
 }
 
+async function applyZip(files) {
+  const cfg = files.find(f => /room\.json$/i.test(f.name));
+  if (cfg) {
+    try {
+      const j = JSON.parse(new TextDecoder().decode(cfg.data));
+      if (j.w) $('rw').value = j.w;
+      if (j.d) $('rd').value = j.d;
+      if (j.h) $('rh').value = j.h;
+      for (const k of ['rw', 'rd', 'rh']) { $(k).nextElementSibling.textContent = $(k).value; store.set('dim_' + k, +$(k).value); }
+      if (typeof j.yaw === 'number') setRoomYaw(j.yaw);
+    } catch {}
+  }
+  const obj = !cfg && files.find(f => /\.obj$/i.test(f.name));
+  if (obj) {                                   // старый формат: размеры из модели
+    const txt = new TextDecoder().decode(obj.data);
+    const xs = [], ys = [], zs = [];
+    for (const line of txt.split('\n'))
+      if (line.startsWith('v ')) { const q = line.split(/\s+/); xs.push(+q[1]); ys.push(+q[2]); zs.push(+q[3]); }
+    if (xs.length) {
+      const r = a => +(Math.max(...a) - Math.min(...a)).toFixed(2);
+      $('rw').value = r(xs); $('rh').value = r(ys); $('rd').value = r(zs);
+      for (const k of ['rw', 'rd', 'rh']) { $(k).nextElementSibling.textContent = $(k).value; store.set('dim_' + k, +$(k).value); }
+    }
+  }
+  let n = 0;
+  for (const f of FACES) {
+    const img = pickFace(files, f);
+    if (!img) continue;
+    roomPics[f.id] = await shrink(new Blob([img.data]), 768);
+    n++;
+  }
+  saveRoom(); drawSlots(); rebuildRoom();
+  return n;
+}
+
 $('roomZip').onchange = async e => {
   const file = e.target.files[0];
   if (!file) return;
   $('objInfo').textContent = 'Читаю архив…';
   try {
-    const files = await readZip(file);
-    const cfg = files.find(f => /room\.json$/i.test(f.name));
-    if (cfg) {
-      try {
-        const j = JSON.parse(new TextDecoder().decode(cfg.data));
-        if (j.w) $('rw').value = j.w;
-        if (j.d) $('rd').value = j.d;
-        if (j.h) $('rh').value = j.h;
-        for (const k of ['rw', 'rd', 'rh']) { $(k).nextElementSibling.textContent = $(k).value; store.set('dim_' + k, +$(k).value); }
-        if (typeof j.yaw === 'number') setRoomYaw(j.yaw);
-      } catch {}
-    }
-    const obj = !cfg && files.find(f => /\.obj$/i.test(f.name));
-    if (obj) {                           // старый формат: размеры из модели
-      const txt = new TextDecoder().decode(obj.data);
-      const xs = [], ys = [], zs = [];
-      for (const line of txt.split('\n'))
-        if (line.startsWith('v ')) { const q = line.split(/\s+/); xs.push(+q[1]); ys.push(+q[2]); zs.push(+q[3]); }
-      if (xs.length) {
-        const r = (a) => +(Math.max(...a) - Math.min(...a)).toFixed(2);
-        $('rw').value = r(xs); $('rh').value = r(ys); $('rd').value = r(zs);
-        for (const k of ['rw', 'rd', 'rh']) { $(k).nextElementSibling.textContent = $(k).value; store.set('dim_' + k, +$(k).value); }
-      }
-    }
-    let n = 0;
-    for (const f of FACES) {
-      const img = pickFace(files, f);
-      if (!img) continue;
-      roomPics[f.id] = await shrink(new Blob([img.data]), 768);
-      n++;
-    }
-    saveRoom(); drawSlots(); rebuildRoom();
-    $('objInfo').textContent = n ? `Из архива взято граней: ${n}` : 'В архиве не нашлись картинки с именами front/right/back/left/floor/ceiling';
+    const n = await applyZip(await readZip(file));
+    $('objInfo').textContent = n ? `Из архива взято граней: ${n}`
+      : 'В архиве нет картинок с именами +z, +x, -z, -x, +y, -y';
   } catch (err) { $('objInfo').textContent = 'Не удалось прочитать: ' + err.message; }
 };
 
@@ -888,17 +1058,14 @@ function makeZip(entries) {
 $('dlRoom').onclick = async () => {
   const have = FACES.filter(f => roomPics[f.id]);
   if (!have.length) { $('objInfo').textContent = 'Сначала добавь хотя бы одно фото'; return; }
-  const enc = new TextEncoder();
-  const entries = [];
+  const enc = new TextEncoder(), entries = [];
   for (const f of have) {
     const b = await (await fetch(roomPics[f.id])).arrayBuffer();
     entries.push({ name: f.id + '.jpg', data: new Uint8Array(b) });
   }
-  // размеры рядом с картинками - этого достаточно, модель собирается из имён
   entries.push({ name: 'room.json', data: enc.encode(JSON.stringify(
     { w: roomDims.w, d: roomDims.d, h: roomDims.h, yaw: roomYaw,
       note: '+z вперёд, -z назад, +x вправо, -x влево, +y вверх, -y вниз' }, null, 2)) });
-
   const a = document.createElement('a');
   a.href = URL.createObjectURL(makeZip(entries));
   a.download = 'room.zip';
@@ -908,25 +1075,21 @@ $('dlRoom').onclick = async () => {
 
 loadRoom(); drawSlots(); rebuildRoom();
 
-// если модель лежит рядом с сайтом - подхватим её (room.zip в папке сайта)
+// если room.zip лежит рядом с сайтом - берём его как комнату по умолчанию
 (async () => {
   if (FACES.some(f => roomPics[f.id])) return;
   try {
     const r = await fetch('room.zip');
     if (!r.ok) return;
-    const files = await readZip(new Blob([await r.arrayBuffer()]));
-    let n = 0;
-    for (const f of FACES) {
-      const img = pickFace(files, f);
-      if (img) { roomPics[f.id] = await shrink(new Blob([img.data]), 768); n++; }
-    }
-    if (n) { drawSlots(); rebuildRoom(); $('objInfo').textContent = `Комната с сайта: ${n} граней`; }
+    const n = await applyZip(await readZip(new Blob([await r.arrayBuffer()])));
+    if (n) $('objInfo').textContent = `Комната с сайта: ${n} граней`;
   } catch {}
 })();
 
-let useWebcamHead = store.get('webHead', true);
-$('webHead').checked = useWebcamHead;
-$('webHead').onchange = () => { useWebcamHead = $('webHead').checked; store.set('webHead', useWebcamHead); };
+// для отладки из консоли браузера
+window.SSSR = { cube, phoneCam, roomPics, FACES, get dims() { return { w: roomDims.w, d: roomDims.d, h: roomDims.h }; } };
+
+
 
 let vrStarted = false;
 $('startVr').onclick = async () => {
@@ -997,118 +1160,12 @@ function startVr() {
   const handR = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.07, 0.07), handMat(0x4f8cff));
   camera.add(handL, handR);
 
-  // ---- гироскоп -> поворот камеры ----
-  let ori = null, yawOffset = 0, gyroEvents = 0, gyroKind = '';
-  // разные браузеры шлют разное: absolute (компас) надёжнее, но есть не везде
-  function onOri(kind) {
-    return e => {
-      if (e.alpha === null || e.alpha === undefined) return;
-      // пришло absolute - не даём обычному его перебить
-      if (gyroKind === 'absolute' && kind !== 'absolute') return;
-      ori = e; gyroKind = kind; gyroEvents++;
-    };
-  }
-  addEventListener('deviceorientationabsolute', onOri('absolute'));
-  addEventListener('deviceorientation', onOri('relative'));
-  const zee = new THREE.Vector3(0, 0, 1), euler = new THREE.Euler(), q0 = new THREE.Quaternion();
-  const q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
-  const qYaw = new THREE.Quaternion(), qDev = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0);
-  const qZero = new THREE.Quaternion();   // куда смотрел телефон в момент "Центра"
   const deg = Math.PI / 180;
-  function deviceQuat(out) {
-    const angle = (screen.orientation ? screen.orientation.angle : window.orientation || 0) * deg;
-    euler.set(ori.beta * deg, ori.alpha * deg, -ori.gamma * deg, 'YXZ');
-    out.setFromEuler(euler).multiply(q1).multiply(q0.setFromAxisAngle(zee, -angle));
-    return out;
-  }
-  // ---- запасной путь: devicemotion (акселерометр + гироскоп, без компаса) ----
-  // Нужен телефонам, которые не шлют deviceorientation (нет магнитометра).
-  // Наклон берём из гравитации, поворот влево/вправо - из гироскопа (медленно уплывает, лечится "Центром").
-  const motion = {
-    events: 0, hasRate: false, hasGrav: false, ready: false,
-    q: new THREE.Quaternion(),            // device -> world (Z вверх), как в deviceorientation
-    g: new THREE.Vector3(0, 0, 1),
-    rate: new THREE.Vector3(),            // рад/с по осям устройства
-    last: 0,
-    _dq: new THREE.Quaternion(), _axis: new THREE.Vector3(), _v: new THREE.Vector3(),
-    _up: new THREE.Vector3(0, 0, 1), _err: new THREE.Vector3(), _qc: new THREE.Quaternion(),
 
-    onEvent(e) {
-      const a = e.accelerationIncludingGravity, r = e.rotationRate;
-      if (a && a.x !== null) {
-        this.hasGrav = true;
-        this._v.set(a.x, a.y, a.z);
-        if (this._v.lengthSq() > 1) {
-          this._v.normalize();
-          this.g.lerp(this._v, 0.12);     // сглаживаем дрожание
-          if (!this.ready) { this.initFromGravity(); this.ready = true; }
-        }
-      }
-      if (r && r.alpha !== null) {
-        this.hasRate = true;
-        this.rate.set(r.beta || 0, r.gamma || 0, r.alpha || 0).multiplyScalar(deg);
-      }
-      this.events++;
-    },
-
-    initFromGravity() {                   // поворот, переводящий измеренную гравитацию в "вверх"
-      this.q.setFromUnitVectors(this._v.clone().normalize(), this._up);
-    },
-
-    update(dt) {
-      if (!this.ready) return;
-      dt = Math.min(dt, 0.1);
-
-      // Нет гироскопа - строим наклон прямо из гравитации, без накопления.
-      // Так ничего не уплывает и не крутит; поворот вбок всё равно даёт только вебка.
-      if (!this.hasRate) {
-        this._v.copy(this.g).normalize();
-        this.q.setFromUnitVectors(this._v, this._up);
-        return;
-      }
-
-      {                                   // интегрируем угловую скорость
-        const w = this.rate, len = w.length();
-        if (len > 1e-4) {
-          this._axis.copy(w).divideScalar(len);
-          this._dq.setFromAxisAngle(this._axis, len * dt);
-          this.q.multiply(this._dq);
-        }
-      }
-      // держим горизонт по гравитации: иначе картинка уплывает
-      this._v.copy(this.g).applyQuaternion(this.q);
-      this._err.crossVectors(this._v, this._up);
-      const s = this._err.length();
-      if (s > 1e-5) {
-        this._axis.copy(this._err).divideScalar(s);
-        this._qc.setFromAxisAngle(this._axis, Math.asin(Math.min(s, 1)) * (this.hasRate ? 0.08 : 0.5));
-        this.q.premultiply(this._qc);
-      }
-      this.q.normalize();
-    },
-
-    toCamera(out) {                       // device -> камера three.js, с учётом поворота экрана
-      const angle = (screen.orientation ? screen.orientation.angle : window.orientation || 0) * deg;
-      return out.copy(this.q).multiply(q1).multiply(q0.setFromAxisAngle(zee, -angle));
-    }
-  };
-  addEventListener('devicemotion', e => motion.onEvent(e));
-
-  function headQuat(out) {                // текущий поворот головы, откуда бы он ни пришёл
-    if (ori) return deviceQuat(out);
-    if (motion.ready) return motion.toCamera(out);
-    return null;
-  }
-
-  // "Центр": текущее положение телефона becomes "смотрю вперёд".
-  // Поэтому неважно, как телефон лежит в коробке и как браузер трактует оси.
+  // "Центр": считаем, что сейчас пользователь смотрит вперёд по комнате
   function recenter() {
-    camHead.zeroYaw = camHead.yaw; camHead.zeroPitch = camHead.pitch;
-    phoneCam.zeroYaw = phoneHead.yaw; phoneCam.zeroPitch = phoneHead.pitch;
     dragYaw = 0; dragPitch = 0;
-    const q = headQuat(qDev);
-    if (!q) { qZero.identity(); return; }
-    qZero.copy(q).invert();
+    if (cube.ready && cube.locked) setRoomYaw(cube.yaw);
   }
   $('recenter').onclick = recenter;
   // комната встала не той стеной - доворачиваем её прямо в очках
@@ -1117,19 +1174,18 @@ function startVr() {
   // показывает, идут ли данные гироскопа (видно прямо в VR)
   const gi = $('gyroInfo');
   gi.onclick = () => {
-    if (ori) alert(`Датчик: deviceorientation (${gyroKind})\nсобытий: ${gyroEvents}\nalpha ${ori.alpha?.toFixed(0)}  beta ${ori.beta?.toFixed(0)}  gamma ${ori.gamma?.toFixed(0)}`);
-    else if (motion.ready) alert(`Датчик: devicemotion\nсобытий: ${motion.events}\nгироскоп: ${motion.hasRate ? 'есть' : 'НЕТ (повороты - пальцем)'}\nакселерометр: ${motion.hasGrav ? 'есть' : 'нет'}\n\nЕсли картинка уплывает - жми "Центр".`);
-    else alert(`Данных нет.\norientation: ${gyroEvents}, motion: ${motion.events}\nСтраница: ${location.protocol}\n\nПохоже, в телефоне нет датчиков или браузер их не отдаёт. Крути вид пальцем.`);
+    alert(`Компас по комнате\n\nкамера: ${phoneCam.on ? 'работает' : (phoneCam.err || 'выключена')}` +
+          `\nпанорама: ${cube.ready ? 'готова' : 'нет фотографий'}` +
+          `\nпривязка: ${cube.locked ? 'есть' : 'ищет'}` +
+          `\nугол: ${cube.yaw | 0}°, наклон: ${cube.pitch | 0}°` +
+          `\nрасхождение: ${cube.err === 999 ? '—' : cube.err.toFixed(1)} (чем меньше, тем лучше)`);
   };
   setInterval(() => {
-    const web = useWebcamHead && performance.now() - camHead.alive < 500;
-    const t = ori ? `gyro ${gyroKind === 'absolute' ? 'A' : 'R'} ${ori.alpha | 0}/${ori.beta | 0}/${ori.gamma | 0}`
-            : motion.hasRate ? 'motion ✓'
-            : motion.ready ? `наклон + ${phoneCam.on && phoneHead.pano.cover > 0.5 ? 'камера ' + (phoneHead.yaw | 0) + '°' : web ? 'вебка ' + (camHead.yaw | 0) + '°' : 'палец'}`
-            : web ? `вебка ${camHead.yaw | 0}° / ${camHead.pitch | 0}°`
-            : 'нет датчиков (палец)';
-    gi.textContent = t;
-    gi.style.color = (ori || motion.ready) ? 'var(--accent)' : 'var(--warn)';
+    gi.textContent = !phoneCam.on ? 'камера ✕'
+                   : !cube.ready ? 'нет комнаты'
+                   : cube.locked ? `${cube.yaw | 0}° / ${cube.pitch | 0}°  (${cube.err.toFixed(0)})`
+                   : `ищу… (${cube.err === 999 ? '—' : cube.err.toFixed(0)})`;
+    gi.style.color = cube.locked ? 'var(--accent)' : 'var(--warn)';
   }, 300);
 
   // без гироскопа (проверка на ПК): поворот пальцем / мышью
@@ -1234,26 +1290,10 @@ function startVr() {
   renderer.setAnimationLoop(() => {
     if (!box.classList.contains('on')) return;
     if (box.clientWidth && (renderer.domElement.width === 0)) resize();
-    const now = performance.now();
-    const dt = Math.min((now - lastFrame) / 1000, 0.1); lastFrame = now;
-    if (!ori && motion.ready) motion.update(dt);
-
-    // откуда брать поворот вбок: гироскоп -> камера телефона -> вебка ПК -> палец
-    const webLive = useWebcamHead && performance.now() - camHead.alive < 500;
-    const phoneLive = $('phoneCam').checked && phoneCam.on && phoneHead.pano.cover > 0.5;
-    const sideYaw = phoneLive ? -(phoneHead.yaw - phoneCam.zeroYaw) * deg
-                  : webLive ? -(camHead.yaw - camHead.zeroYaw) * deg
-                  : dragYaw;
-
-    const q = headQuat(qDev);
-    if (q) {
-      // наклон берём с датчика телефона, поворот вбок - с вебки или пальцем
-      const extra = (ori || motion.hasRate) ? 0 : sideYaw;
-      qYaw.setFromAxisAngle(Y, extra);
-      camera.quaternion.copy(qYaw).multiply(qZero).multiply(q);
-    } else if (phoneLive || webLive) {
-      const p = phoneLive ? -(phoneHead.pitch - phoneCam.zeroPitch) : -(camHead.pitch - camHead.zeroPitch);
-      camera.quaternion.setFromEuler(new THREE.Euler(p * deg + dragPitch, sideYaw, 0, 'YXZ'));
+    // направление взгляда даёт только сравнение кадра камеры с комнатой
+    if (cube.ready && cube.locked) {
+      camera.quaternion.setFromEuler(new THREE.Euler(
+        cube.pitch * deg, -cube.yaw * deg + roomYaw * deg, 0, 'YXZ'));
     } else {
       camera.quaternion.setFromEuler(new THREE.Euler(dragPitch, dragYaw, 0, 'YXZ'));
     }
